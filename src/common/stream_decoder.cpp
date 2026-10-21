@@ -1,5 +1,6 @@
 #include "common/stream_decoder.h"
 
+#include <algorithm>
 #include <cstddef>
 
 namespace monitor::protocol {
@@ -9,20 +10,50 @@ std::vector<Message> StreamDecoder::feed(const std::span<const std::uint8_t> chu
         throw ProtocolError("stream decoder is poisoned");
     }
 
-    buffer_.insert(buffer_.end(), chunk.begin(), chunk.end());
     std::vector<Message> messages;
+    std::size_t read_position = 0;
     try {
-        while (buffer_.size() >= kHeaderSize) {
+        while (read_position < chunk.size()) {
+            const std::span<const std::uint8_t> remaining = chunk.subspan(read_position);
+            if (buffer_.empty() && remaining.size() >= kHeaderSize) {
+                const PacketHeader header = decode_header(remaining.first(kHeaderSize));
+                const std::size_t packet_size = kHeaderSize + header.payload_size;
+                if (remaining.size() >= packet_size) {
+                    messages.push_back(decode_packet(remaining.first(packet_size)));
+                    read_position += packet_size;
+                    continue;
+                }
+                buffer_.reserve(packet_size);
+                buffer_.insert(buffer_.end(), remaining.begin(), remaining.end());
+                break;
+            }
+
+            if (buffer_.size() < kHeaderSize) {
+                const std::size_t bytes_to_header =
+                    std::min(kHeaderSize - buffer_.size(), remaining.size());
+                buffer_.insert(buffer_.end(), remaining.begin(),
+                               remaining.begin() + static_cast<std::ptrdiff_t>(bytes_to_header));
+                read_position += bytes_to_header;
+                if (buffer_.size() < kHeaderSize) {
+                    break;
+                }
+            }
+
             const PacketHeader header =
                 decode_header(std::span<const std::uint8_t>(buffer_).first(kHeaderSize));
             const std::size_t packet_size = kHeaderSize + header.payload_size;
+            buffer_.reserve(packet_size);
+            const std::size_t bytes_to_packet =
+                std::min(packet_size - buffer_.size(), chunk.size() - read_position);
+            buffer_.insert(
+                buffer_.end(), chunk.begin() + static_cast<std::ptrdiff_t>(read_position),
+                chunk.begin() + static_cast<std::ptrdiff_t>(read_position + bytes_to_packet));
+            read_position += bytes_to_packet;
             if (buffer_.size() < packet_size) {
                 break;
             }
-            messages.push_back(
-                decode_packet(std::span<const std::uint8_t>(buffer_).first(packet_size)));
-            buffer_.erase(buffer_.begin(),
-                          buffer_.begin() + static_cast<std::ptrdiff_t>(packet_size));
+            messages.push_back(decode_packet(buffer_));
+            buffer_.clear();
         }
     } catch (const ProtocolError&) {
         poisoned_ = true;

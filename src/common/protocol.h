@@ -15,7 +15,10 @@ using Bytes = std::vector<std::uint8_t>;
 inline constexpr std::uint32_t kMagic = 0x5754524B;
 inline constexpr std::uint16_t kVersion = 1;
 inline constexpr std::size_t kHeaderSize = 12;
-inline constexpr std::uint32_t kMaxPayloadSize = 8U * 1024U * 1024U;
+inline constexpr std::size_t kMaxPacketSize = 8U * 1024U * 1024U;
+inline constexpr std::uint32_t kMaxPayloadSize =
+    static_cast<std::uint32_t>(kMaxPacketSize - kHeaderSize);
+inline constexpr std::uint32_t kMaxControlPayloadSize = 2048;
 inline constexpr std::size_t kMaxControlStringBytes = 1024;
 
 enum class MessageType : std::uint16_t {

@@ -8,8 +8,9 @@ decoding. It does not include capture, networking, UI, configuration, archives,
 or load simulation.
 
 The protocol uses a fixed 12-byte, network-byte-order header containing magic,
-version, message type, and payload length. Packets are capped at 8 MiB; control
-payloads and UTF-8 control strings use tighter limits.
+version, message type, and payload length. Each complete packet, including its
+header, is capped at 8 MiB; control payloads and UTF-8 control strings use
+tighter limits.
 
 From PowerShell:
 

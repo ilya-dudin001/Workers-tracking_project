@@ -20,6 +20,28 @@ using monitor::protocol::ProtocolError;
 using monitor::protocol::RenameAck;
 using monitor::protocol::SetProfile;
 
+static_assert(monitor::protocol::kMaxPacketSize == 8U * 1024U * 1024U);
+static_assert(monitor::protocol::kMaxPayloadSize + monitor::protocol::kHeaderSize ==
+              monitor::protocol::kMaxPacketSize);
+
+void write_u32(Bytes& bytes, const std::size_t offset, const std::uint32_t value) {
+    bytes[offset] = static_cast<std::uint8_t>(value >> 24);
+    bytes[offset + 1] = static_cast<std::uint8_t>(value >> 16);
+    bytes[offset + 2] = static_cast<std::uint8_t>(value >> 8);
+    bytes[offset + 3] = static_cast<std::uint8_t>(value);
+}
+
+Bytes header_for(const std::uint16_t type, const std::uint32_t payload_size) {
+    Bytes header(monitor::protocol::kHeaderSize, 0);
+    write_u32(header, 0, monitor::protocol::kMagic);
+    header[4] = static_cast<std::uint8_t>(monitor::protocol::kVersion >> 8);
+    header[5] = static_cast<std::uint8_t>(monitor::protocol::kVersion);
+    header[6] = static_cast<std::uint8_t>(type >> 8);
+    header[7] = static_cast<std::uint8_t>(type);
+    write_u32(header, 8, payload_size);
+    return header;
+}
+
 template <typename T>
 T round_trip(const T& message) {
     const Bytes packet = monitor::protocol::encode(Message{message});
@@ -57,6 +79,15 @@ TEST(ProtocolWireFormat, HeaderUsesNetworkByteOrder) {
               (Bytes{1, 2, 3, 4, 5, 6, 7, 8}));
 }
 
+TEST(ProtocolWireFormat, DecodesKnownNonSymmetricUint64InNetworkOrder) {
+    Bytes packet = header_for(3, 8);
+    packet.insert(packet.end(), {0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF});
+
+    const auto decoded = monitor::protocol::decode_packet(packet);
+
+    EXPECT_EQ(std::get<Heartbeat>(decoded).timestamp_ms, 0x0123456789ABCDEFULL);
+}
+
 TEST(ProtocolValidation, RejectsUnknownVersion) {
     Bytes packet = monitor::protocol::encode(Message{Heartbeat{1}});
     packet[5] = 2;
@@ -90,19 +121,22 @@ TEST(ProtocolValidation, RejectsTrailingBytes) {
 }
 
 TEST(ProtocolValidation, RejectsGlobalPacketLimitInHeader) {
-    Bytes header(monitor::protocol::kHeaderSize, 0);
-    header[0] = 0x57;
-    header[1] = 0x54;
-    header[2] = 0x52;
-    header[3] = 0x4B;
-    header[5] = 1;
-    header[7] = 3;
-    const std::uint32_t oversized = monitor::protocol::kMaxPayloadSize + 1;
-    header[8] = static_cast<std::uint8_t>(oversized >> 24);
-    header[9] = static_cast<std::uint8_t>(oversized >> 16);
-    header[10] = static_cast<std::uint8_t>(oversized >> 8);
-    header[11] = static_cast<std::uint8_t>(oversized);
-    EXPECT_THROW(static_cast<void>(monitor::protocol::decode_packet(header)), ProtocolError);
+    const auto oversized_payload =
+        static_cast<std::uint32_t>(monitor::protocol::kMaxPacketSize -
+                                   monitor::protocol::kHeaderSize + 1);
+    const Bytes header = header_for(2, oversized_payload);
+    EXPECT_THROW(static_cast<void>(monitor::protocol::decode_header(header)), ProtocolError);
+}
+
+TEST(ProtocolValidation, RejectsFrameWhoseTotalPacketExceedsLimit) {
+    constexpr std::size_t frame_metadata_size = 20;
+    const std::size_t oversized_image_size =
+        monitor::protocol::kMaxPacketSize - monitor::protocol::kHeaderSize -
+        frame_metadata_size + 1;
+    const Frame frame{1, 1, 1, Bytes(oversized_image_size, 0x5A)};
+
+    EXPECT_THROW(static_cast<void>(monitor::protocol::encode(Message{frame})), ProtocolError);
+    EXPECT_EQ(frame.encoded_image.size(), oversized_image_size);
 }
 
 TEST(ProtocolValidation, RejectsOversizedControlString) {
@@ -115,6 +149,30 @@ TEST(ProtocolValidation, RejectsInvalidUtf8) {
     EXPECT_THROW(static_cast<void>(
                      monitor::protocol::encode(Message{Hello{std::string("\xC3\x28", 2)}})),
                  ProtocolError);
+}
+
+TEST(ProtocolValidation, RejectsInvalidUtf8FromWire) {
+    Bytes packet = monitor::protocol::encode(Message{Hello{"ok"}});
+    packet[monitor::protocol::kHeaderSize + 2] = 0xC3;
+    packet[monitor::protocol::kHeaderSize + 3] = 0x28;
+
+    EXPECT_THROW(static_cast<void>(monitor::protocol::decode_packet(packet)), ProtocolError);
+}
+
+TEST(ProtocolValidation, RejectsOversizedControlStringLengthFromWire) {
+    Bytes packet = header_for(1, 2);
+    const std::size_t oversized = monitor::protocol::kMaxControlStringBytes + 1;
+    packet.push_back(static_cast<std::uint8_t>(oversized >> 8));
+    packet.push_back(static_cast<std::uint8_t>(oversized));
+
+    EXPECT_THROW(static_cast<void>(monitor::protocol::decode_packet(packet)), ProtocolError);
+}
+
+TEST(ProtocolValidation, RejectsOversizedControlPayloadFromWire) {
+    const Bytes header =
+        header_for(1, monitor::protocol::kMaxControlPayloadSize + 1);
+
+    EXPECT_THROW(static_cast<void>(monitor::protocol::decode_header(header)), ProtocolError);
 }
 
 TEST(ProtocolValidation, RejectsMalformedFixedPayload) {

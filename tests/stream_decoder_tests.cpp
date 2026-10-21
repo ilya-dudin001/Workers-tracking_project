@@ -88,7 +88,9 @@ TEST(StreamDecoder, MalformedHeaderPoisonsDecoder) {
 
 TEST(StreamDecoder, OversizedHeaderPoisonsDecoderBeforePayloadArrives) {
     Bytes packet = monitor::protocol::encode(Message{Heartbeat{1}});
-    const std::uint32_t size = monitor::protocol::kMaxPayloadSize + 1;
+    const std::uint32_t size =
+        static_cast<std::uint32_t>(monitor::protocol::kMaxPacketSize -
+                                   monitor::protocol::kHeaderSize + 1);
     packet.resize(monitor::protocol::kHeaderSize);
     packet[8] = static_cast<std::uint8_t>(size >> 24);
     packet[9] = static_cast<std::uint8_t>(size >> 16);
@@ -98,6 +100,44 @@ TEST(StreamDecoder, OversizedHeaderPoisonsDecoderBeforePayloadArrives) {
 
     EXPECT_THROW(static_cast<void>(decoder.feed(packet)), ProtocolError);
     EXPECT_TRUE(decoder.poisoned());
+}
+
+TEST(StreamDecoder, BuffersAtMostOneIncompleteMaximumPacket) {
+    constexpr std::size_t frame_metadata_size = 20;
+    const std::size_t image_size =
+        monitor::protocol::kMaxPacketSize - monitor::protocol::kHeaderSize -
+        frame_metadata_size;
+    const Bytes packet =
+        monitor::protocol::encode(Message{monitor::protocol::Frame{7, 1, 1, Bytes(image_size)}});
+    ASSERT_EQ(packet.size(), monitor::protocol::kMaxPacketSize);
+    StreamDecoder decoder;
+
+    EXPECT_TRUE(decoder.feed(std::span(packet).first(packet.size() - 1)).empty());
+    EXPECT_EQ(decoder.buffered_size(), monitor::protocol::kMaxPacketSize - 1);
+    const auto decoded = decoder.feed(std::span(packet).last(1));
+
+    ASSERT_EQ(decoded.size(), 1U);
+    EXPECT_EQ(std::get<monitor::protocol::Frame>(decoded.front()).sequence, 7U);
+    EXPECT_EQ(decoder.buffered_size(), 0U);
+}
+
+TEST(StreamDecoder, AcceptsManyCompletePacketsInChunkLargerThanPacketLimit) {
+    constexpr std::size_t image_size = 1024U * 1024U;
+    constexpr std::size_t packet_count = 9;
+    const Bytes packet =
+        monitor::protocol::encode(Message{monitor::protocol::Frame{3, 1, 1, Bytes(image_size)}});
+    Bytes chunk;
+    chunk.reserve(packet.size() * packet_count);
+    for (std::size_t count = 0; count < packet_count; ++count) {
+        chunk.insert(chunk.end(), packet.begin(), packet.end());
+    }
+    ASSERT_GT(chunk.size(), monitor::protocol::kMaxPacketSize);
+    StreamDecoder decoder;
+
+    const auto decoded = decoder.feed(chunk);
+
+    EXPECT_EQ(decoded.size(), packet_count);
+    EXPECT_EQ(decoder.buffered_size(), 0U);
 }
 
 }

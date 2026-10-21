@@ -1,14 +1,13 @@
 #include "common/protocol.h"
 
 #include <algorithm>
-#include <limits>
 #include <string_view>
 #include <type_traits>
 
 namespace monitor::protocol {
 namespace {
 
-constexpr std::uint32_t kMaxControlPayloadSize = 2048;
+constexpr std::size_t kFrameMetadataSize = 20;
 
 void append_u16(Bytes& output, const std::uint16_t value) {
     output.push_back(static_cast<std::uint8_t>(value >> 8));
@@ -103,7 +102,9 @@ public:
     }
 
     std::uint64_t u64() {
-        return (static_cast<std::uint64_t>(u32()) << 32) | u32();
+        const std::uint64_t high = u32();
+        const std::uint64_t low = u32();
+        return (high << 32) | low;
     }
 
     Bytes bytes(const std::size_t size) {
@@ -171,9 +172,10 @@ Bytes encode_payload(const Message& message) {
             if constexpr (std::is_same_v<T, Hello>) {
                 append_control_string(payload, value.name);
             } else if constexpr (std::is_same_v<T, Frame>) {
-                if (value.encoded_image.size() > std::numeric_limits<std::uint32_t>::max()) {
+                if (value.encoded_image.size() > kMaxPayloadSize - kFrameMetadataSize) {
                     throw ProtocolError("frame is too large");
                 }
+                payload.reserve(kFrameMetadataSize + value.encoded_image.size());
                 append_u64(payload, value.sequence);
                 append_u32(payload, value.width);
                 append_u32(payload, value.height);
