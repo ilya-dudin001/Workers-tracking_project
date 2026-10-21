@@ -83,8 +83,36 @@ add_executable(WorkerAgent WIN32 src/worker_agent/main.cpp)
 target_link_libraries(WorkerAgent PRIVATE worker_common worker_capture worker_transport)
 enable_strict_warnings(WorkerAgent)
 
-add_executable(Observer WIN32 src/observer/main.cpp)
-target_link_libraries(Observer PRIVATE worker_common)
+add_library(observer_core)
+target_sources(observer_core
+    PUBLIC
+        FILE_SET HEADERS
+        BASE_DIRS src
+        FILES
+            src/observer/agent_registry.h
+            src/observer/focus_router.h
+            src/observer/iocp_server.h
+            src/observer/jpeg_decoder.h
+            src/observer/layout.h
+            src/observer/name_store.h
+    PRIVATE
+        src/observer/agent_registry.cpp
+        src/observer/focus_router.cpp
+        src/observer/iocp_server.cpp
+        src/observer/jpeg_decoder.cpp
+        src/observer/layout.cpp
+        src/observer/name_store.cpp
+)
+target_include_directories(observer_core PUBLIC src)
+target_link_libraries(observer_core PUBLIC worker_common PRIVATE windowscodecs ole32)
+enable_strict_warnings(observer_core)
+
+add_executable(Observer WIN32
+    src/observer/main.cpp
+    src/observer/observer_window.cpp
+    src/observer/observer_window.h
+)
+target_link_libraries(Observer PRIVATE observer_core d2d1 dwrite windowscodecs ole32 shell32)
 enable_strict_warnings(Observer)
 
 include(CTest)
@@ -103,12 +131,14 @@ if(BUILD_TESTING)
         tests/capture_coordinator_tests.cpp
         tests/capture_core_tests.cpp
         tests/image_processor_tests.cpp
+        tests/observer_core_tests.cpp
+        tests/observer_server_tests.cpp
         tests/protocol_tests.cpp
         tests/stream_decoder_tests.cpp
         tests/winsock_integration_tests.cpp
         tests/windows_capture_tests.cpp
     )
-    target_link_libraries(common_tests PRIVATE worker_common worker_capture worker_transport GTest::gtest_main)
+    target_link_libraries(common_tests PRIVATE worker_common worker_capture worker_transport observer_core GTest::gtest_main)
     enable_strict_warnings(common_tests)
 
     include(GoogleTest)
