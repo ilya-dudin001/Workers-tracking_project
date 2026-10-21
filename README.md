@@ -11,8 +11,10 @@ The C++20 CMake/MSVC project currently includes:
 - `worker_transport`: single-owner agent sessions, finite-timeout Winsock
   transport, reconnect/heartbeat scheduling, adaptive Grid rate control, and a
   composable orchestration boundary with a latest-only encoded-frame handoff.
-- `WorkerAgent`: links the capture and transport primitives but intentionally
-  does not start a continuous application loop yet.
+- `worker_agent_app`: validated persistent agent configuration, HKCU autostart,
+  bounded logging, and testable capture/transport lifetime control.
+- `WorkerAgent`: a per-user single-instance Win32 tray application with a
+  Russian first-run/settings window and continuous primary-display monitoring.
 - `observer_core`: thread-safe agent registry, IOCP server, layout/profile
   routing, WIC JPEG decoding, and local rename persistence.
 - `Observer`: a native Win32 Direct2D/DirectWrite monitoring wall.
@@ -73,9 +75,37 @@ Online/Stale/Offline status. It sends the Grid profile on registration and the
 1280x720, 250 ms, JPEG-quality-75 Focus profile only to the selected agent.
 
 This stage is LAN/local use only: it has **no authentication, authorization,
-encryption, or Windows Firewall installer rule**. WorkerAgent
-tray/configuration/autostart, archives/IFrameSink, load simulation, packaging,
-and installer work remain outside this stage.
+encryption, Windows Firewall automation, archive, load simulator, packaging, or
+installer**.
+
+## WorkerAgent
+
+Run `WorkerAgent.exe` as the interactive employee user; administrator rights
+are not required. On first launch, the Russian setup window requests the
+employee name, Observer IPv4 address, port (default **45873**), and optional
+per-user autostart. Cancel exits without starting monitoring. Configuration and
+the stable random 16-byte agent identity are stored atomically under
+`%LOCALAPPDATA%\WorkersTracking\agent`; corrupt or oversized configuration
+opens setup again rather than using a temporary-directory fallback.
+
+While monitoring is active, the notification-area icon remains present and its
+tooltip reports connection state. Left-click shows status. Right-click shows
+the explicit active-screen-monitoring status, **Настройки**, the actual checked
+HKCU autostart state, and **Выход**. Applying name or endpoint settings
+cooperatively stops and restarts capture/transport while preserving identity.
+Explorer restarts recreate the icon. A second launch activates the running
+instance instead of starting another capture session.
+
+Autostart uses the exact quoted executable path in
+`HKCU\Software\Microsoft\Windows\CurrentVersion\Run\WorkerAgent`. Move the
+executable first, then update the checkbox in Settings. Operational diagnostics
+go to a one-backup, 1 MiB bounded `worker_agent.log` beside the configuration;
+screen pixels and encoded images are never logged.
+
+WorkerAgent captures only the primary display in an interactive desktop.
+Capture can pause while Windows is locked, while a secure UAC desktop is
+visible, or when DXGI/GDI is temporarily unavailable; the process remains
+running and retries. It is not a service and does not run in Session 0.
 
 From PowerShell:
 
@@ -86,5 +116,5 @@ $cmake = 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7
 & $cmake --build build --config Release
 & "$([IO.Path]::GetDirectoryName($cmake))\ctest.exe" --test-dir build -C Debug --output-on-failure
 & "$([IO.Path]::GetDirectoryName($cmake))\ctest.exe" --test-dir build -C Release --output-on-failure
-& $cmake --build build --config Debug --target worker_common worker_capture worker_transport observer_core Observer -- /p:RunCodeAnalysis=true
+& $cmake --build build --config Debug --target WorkerAgent worker_agent_app worker_common worker_capture worker_transport observer_core Observer -- /p:RunCodeAnalysis=true
 ```

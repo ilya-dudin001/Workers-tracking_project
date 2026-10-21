@@ -79,8 +79,29 @@ target_include_directories(worker_transport PUBLIC src)
 target_link_libraries(worker_transport PUBLIC worker_common worker_capture)
 enable_strict_warnings(worker_transport)
 
+add_library(worker_agent_app)
+target_sources(worker_agent_app
+    PUBLIC
+        FILE_SET HEADERS
+        BASE_DIRS src
+        FILES
+            src/worker_agent/agent_config.h
+            src/worker_agent/agent_worker.h
+            src/worker_agent/autostart.h
+            src/worker_agent/bounded_log.h
+    PRIVATE
+        src/worker_agent/agent_config.cpp
+        src/worker_agent/agent_worker.cpp
+        src/worker_agent/autostart.cpp
+        src/worker_agent/bounded_log.cpp
+)
+target_include_directories(worker_agent_app PUBLIC src)
+target_link_libraries(worker_agent_app PUBLIC worker_common worker_capture worker_transport
+    PRIVATE advapi32 ole32 shell32 ws2_32)
+enable_strict_warnings(worker_agent_app)
+
 add_executable(WorkerAgent WIN32 src/worker_agent/main.cpp)
-target_link_libraries(WorkerAgent PRIVATE worker_common worker_capture worker_transport)
+target_link_libraries(WorkerAgent PRIVATE worker_agent_app shell32 advapi32 user32 comctl32)
 enable_strict_warnings(WorkerAgent)
 
 add_library(observer_core)
@@ -140,10 +161,11 @@ if(BUILD_TESTING)
         tests/observer_server_tests.cpp
         tests/protocol_tests.cpp
         tests/stream_decoder_tests.cpp
+        tests/stage5_tests.cpp
         tests/winsock_integration_tests.cpp
         tests/windows_capture_tests.cpp
     )
-    target_link_libraries(common_tests PRIVATE worker_common worker_capture worker_transport observer_core GTest::gtest_main)
+    target_link_libraries(common_tests PRIVATE worker_common worker_capture worker_transport worker_agent_app observer_core GTest::gtest_main)
     enable_strict_warnings(common_tests)
 
     include(GoogleTest)
