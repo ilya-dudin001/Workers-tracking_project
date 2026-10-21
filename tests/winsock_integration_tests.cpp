@@ -10,10 +10,12 @@
 #include <cstdint>
 #include <exception>
 #include <future>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <type_traits>
 #include <variant>
@@ -22,6 +24,7 @@
 namespace {
 
 using namespace std::chrono_literals;
+using monitor::net::ReceiveResult;
 using monitor::net::ReceiveStatus;
 using monitor::net::Socket;
 using monitor::net::WinsockRuntime;
@@ -47,47 +50,143 @@ Hello test_hello() {
     return Hello{{0x10, 0x32, 0x54, 0x76}, "Ada", "desk-01"};
 }
 
-template <typename T>
-std::optional<T> finish_server(std::future<T>& result, std::jthread& server) {
-    if (result.wait_for(3s) != std::future_status::ready) {
-        ADD_FAILURE() << "loopback server missed its three-second deadline";
-        server.join();
-        return std::nullopt;
+class LoopbackTestServer {
+public:
+    template <typename Handler>
+    explicit LoopbackTestServer(Handler handler) {
+        listener_ = Socket::tcp();
+        listener_.bind_loopback(0);
+        listener_.listen();
+        port_ = listener_.local_port();
+
+        std::promise<std::vector<Message>> promise;
+        result_ = promise.get_future();
+        worker_ = std::jthread(
+            [this, handler = std::move(handler), promise = std::move(promise)](
+                const std::stop_token stop_token) mutable {
+                try {
+                    Socket peer = accept_until_stopped(stop_token);
+                    ActivePeerRegistration registration(*this, peer);
+                    peer.set_receive_timeout(25ms);
+                    peer.set_send_timeout(100ms);
+                    promise.set_value(handler(peer, stop_token));
+                } catch (...) {
+                    promise.set_exception(std::current_exception());
+                }
+            });
     }
-    try {
-        T value = result.get();
-        server.join();
-        return value;
-    } catch (const std::exception& error) {
-        server.join();
-        ADD_FAILURE() << "loopback server failed: " << error.what();
-        return std::nullopt;
-    } catch (...) {
-        server.join();
-        ADD_FAILURE() << "loopback server failed with a non-standard exception";
-        return std::nullopt;
+
+    ~LoopbackTestServer() {
+        stop_and_join();
     }
+
+    LoopbackTestServer(const LoopbackTestServer&) = delete;
+    LoopbackTestServer& operator=(const LoopbackTestServer&) = delete;
+
+    [[nodiscard]] std::uint16_t port() const noexcept {
+        return port_;
+    }
+
+    [[nodiscard]] std::optional<std::vector<Message>> finish(
+        const std::chrono::milliseconds timeout = 3s) {
+        if (result_.wait_for(timeout) != std::future_status::ready) {
+            ADD_FAILURE() << "loopback server missed its deadline";
+            stop_and_join();
+            return std::nullopt;
+        }
+        try {
+            auto value = result_.get();
+            stop_and_join();
+            return value;
+        } catch (const std::exception& error) {
+            stop_and_join();
+            ADD_FAILURE() << "loopback server failed: " << error.what();
+            return std::nullopt;
+        } catch (...) {
+            stop_and_join();
+            ADD_FAILURE() << "loopback server failed with a non-standard exception";
+            return std::nullopt;
+        }
+    }
+
+private:
+    class ActivePeerRegistration {
+    public:
+        ActivePeerRegistration(LoopbackTestServer& server, Socket& peer)
+            : server_(server) {
+            std::scoped_lock lock(server_.socket_mutex_);
+            server_.active_peer_ = &peer;
+        }
+
+        ~ActivePeerRegistration() {
+            std::scoped_lock lock(server_.socket_mutex_);
+            server_.active_peer_ = nullptr;
+        }
+
+    private:
+        LoopbackTestServer& server_;
+    };
+
+    Socket accept_until_stopped(const std::stop_token stop_token) {
+        while (!stop_token.stop_requested()) {
+            try {
+                return listener_.accept(25ms);
+            } catch (const std::runtime_error& error) {
+                if (std::string_view(error.what()) != "accept timed out") {
+                    throw;
+                }
+            }
+        }
+        throw std::runtime_error("loopback server stopped before accept");
+    }
+
+    void stop_and_join() noexcept {
+        if (!worker_.joinable()) {
+            return;
+        }
+        worker_.request_stop();
+        listener_.shutdown();
+        {
+            std::scoped_lock lock(socket_mutex_);
+            if (active_peer_ != nullptr) {
+                active_peer_->shutdown();
+            }
+        }
+        // All worker waits are capped at 25 ms; sends are capped at 100 ms.
+        worker_.join();
+    }
+
+    Socket listener_;
+    std::uint16_t port_ = 0;
+    std::mutex socket_mutex_;
+    Socket* active_peer_ = nullptr;
+    std::future<std::vector<Message>> result_;
+    std::jthread worker_;
+};
+
+ReceiveResult receive_until_data(Socket& peer,
+                                 const std::stop_token stop_token,
+                                 const std::chrono::steady_clock::time_point deadline) {
+    while (!stop_token.stop_requested() &&
+           std::chrono::steady_clock::now() < deadline) {
+        ReceiveResult received = peer.receive_chunk(256U);
+        if (received.status != ReceiveStatus::TimedOut) {
+            return received;
+        }
+    }
+    throw std::runtime_error("timed out waiting for client data");
 }
 
-bool finish_server(std::future<void>& result, std::jthread& server) {
-    if (result.wait_for(3s) != std::future_status::ready) {
-        ADD_FAILURE() << "loopback server missed its three-second deadline";
-        server.join();
-        return false;
+bool wait_for_signal(std::future<void>& signal,
+                     const std::stop_token stop_token,
+                     const std::chrono::steady_clock::time_point deadline) {
+    while (!stop_token.stop_requested() &&
+           std::chrono::steady_clock::now() < deadline) {
+        if (signal.wait_for(25ms) == std::future_status::ready) {
+            return true;
+        }
     }
-    try {
-        result.get();
-        server.join();
-        return true;
-    } catch (const std::exception& error) {
-        server.join();
-        ADD_FAILURE() << "loopback server failed: " << error.what();
-        return false;
-    } catch (...) {
-        server.join();
-        ADD_FAILURE() << "loopback server failed with a non-standard exception";
-        return false;
-    }
+    return false;
 }
 
 TEST(WinsockSocket, RejectsInvalidIpv4Endpoints) {
@@ -102,61 +201,56 @@ TEST(WinsockSocket, RejectsInvalidIpv4Endpoints) {
 
 TEST(WinsockIntegration, HelloFrameHeartbeatAndSplitCoalescedCommands) {
     WinsockRuntime runtime;
-    Socket listener = Socket::tcp();
-    listener.bind_loopback(0);
-    listener.listen();
-    const std::uint16_t port = listener.local_port();
-
-    std::promise<std::vector<Message>> received_promise;
-    auto received_future = received_promise.get_future();
     std::promise<void> send_remainder_promise;
     auto send_remainder = send_remainder_promise.get_future();
-    std::jthread server([listener = std::move(listener),
-                         promise = std::move(received_promise),
-                         send_remainder = std::move(send_remainder)]() mutable {
-        try {
-            Socket peer = listener.accept(2s);
-            peer.set_receive_timeout(100ms);
-            peer.set_send_timeout(500ms);
+    LoopbackTestServer server(
+        [send_remainder = std::move(send_remainder)](
+            Socket& peer, const std::stop_token stop_token) mutable {
             StreamDecoder decoder;
             std::vector<Message> received;
             const auto receive_deadline = std::chrono::steady_clock::now() + 2s;
-            while (received.size() < 3U &&
+            while (!stop_token.stop_requested() && received.size() < 3U &&
                    std::chrono::steady_clock::now() < receive_deadline) {
-                auto chunk = peer.receive_chunk(64U);
+                const auto chunk = peer.receive_chunk(64U);
                 if (chunk.status == ReceiveStatus::Closed) {
                     break;
                 }
-                if (chunk.status == ReceiveStatus::TimedOut) {
-                    continue;
+                if (chunk.status == ReceiveStatus::Data) {
+                    auto messages = decoder.feed(chunk.bytes);
+                    received.insert(received.end(), messages.begin(), messages.end());
                 }
-                auto messages = decoder.feed(chunk.bytes);
-                received.insert(received.end(), messages.begin(), messages.end());
             }
-
+            if (received.size() != 3U) {
+                throw std::runtime_error("server did not receive three packets");
+            }
             const Bytes first =
                 monitor::protocol::encode(Message{SetProfile{300, 60, 640, 360}});
             const Bytes second =
                 monitor::protocol::encode(Message{SetProfile{450, 50, 480, 270}});
+            if (stop_token.stop_requested()) {
+                throw std::runtime_error("server stopped before command send");
+            }
             peer.send_all(std::span(first).first(5));
-            if (send_remainder.wait_for(2s) != std::future_status::ready) {
+            if (!wait_for_signal(send_remainder,
+                                 stop_token,
+                                 std::chrono::steady_clock::now() + 2s)) {
                 throw std::runtime_error("client did not request command remainder");
             }
             Bytes combined(first.begin() + 5, first.end());
             combined.insert(combined.end(), second.begin(), second.end());
+            if (stop_token.stop_requested()) {
+                throw std::runtime_error("server stopped before remainder send");
+            }
             peer.send_all(combined);
-            promise.set_value(std::move(received));
-        } catch (...) {
-            promise.set_exception(std::current_exception());
-        }
-    });
+            return received;
+        });
 
     WinsockAgentSession session(AgentSessionConfig{
-        AgentEndpoint{"127.0.0.1", port}, test_hello(), 500ms, 200ms});
+        AgentEndpoint{"127.0.0.1", server.port()}, test_hello(), 500ms, 200ms});
     const bool connected = session.connect();
     EXPECT_TRUE(connected);
     if (!connected) {
-        const auto ignored = finish_server(received_future, server);
+        static_cast<void>(server.finish());
         return;
     }
     EXPECT_EQ(session.state(), AgentConnectionState::Online);
@@ -177,7 +271,7 @@ TEST(WinsockIntegration, HelloFrameHeartbeatAndSplitCoalescedCommands) {
         EXPECT_EQ(commands[1], (SetProfile{450, 50, 480, 270}));
     }
 
-    const auto received = finish_server(received_future, server);
+    const auto received = server.finish();
     ASSERT_TRUE(received.has_value());
     ASSERT_EQ(received->size(), 3U);
     EXPECT_TRUE(std::holds_alternative<Hello>((*received)[0]));
@@ -188,33 +282,22 @@ TEST(WinsockIntegration, HelloFrameHeartbeatAndSplitCoalescedCommands) {
 
 TEST(WinsockIntegration, DetectsOrderlyServerCloseWithFiniteTimeout) {
     WinsockRuntime runtime;
-    Socket listener = Socket::tcp();
-    listener.bind_loopback(0);
-    listener.listen();
-    const std::uint16_t port = listener.local_port();
-
-    std::promise<void> server_promise;
-    auto server_result = server_promise.get_future();
-    std::jthread server([listener = std::move(listener),
-                         promise = std::move(server_promise)]() mutable {
-        try {
-            Socket peer = listener.accept(2s);
-            peer.set_receive_timeout(500ms);
-            const auto hello = peer.receive_chunk(256U);
+    LoopbackTestServer server(
+        [](Socket& peer, const std::stop_token stop_token) {
+            const auto hello = receive_until_data(
+                peer, stop_token, std::chrono::steady_clock::now() + 2s);
             if (hello.status != ReceiveStatus::Data) {
                 throw std::runtime_error("server did not receive Hello");
             }
-            promise.set_value();
-        } catch (...) {
-            promise.set_exception(std::current_exception());
-        }
-    });
+            return std::vector<Message>{};
+        });
 
     WinsockAgentSession session(AgentSessionConfig{
-        AgentEndpoint{"127.0.0.1", port}, test_hello(), 500ms, 200ms});
+        AgentEndpoint{"127.0.0.1", server.port()}, test_hello(), 500ms, 200ms});
     const bool connected = session.connect();
     EXPECT_TRUE(connected);
-    EXPECT_TRUE(finish_server(server_result, server));
+    const auto server_result = server.finish();
+    EXPECT_TRUE(server_result.has_value());
     if (!connected) {
         return;
     }
@@ -226,37 +309,34 @@ TEST(WinsockIntegration, DetectsOrderlyServerCloseWithFiniteTimeout) {
 
 TEST(WinsockIntegration, UnexpectedInboundPacketDoesNotEscapeOrchestratorTick) {
     WinsockRuntime runtime;
-    Socket listener = Socket::tcp();
-    listener.bind_loopback(0);
-    listener.listen();
-    const std::uint16_t port = listener.local_port();
-
-    std::promise<void> server_promise;
-    auto server_result = server_promise.get_future();
-    std::jthread server([listener = std::move(listener),
-                         promise = std::move(server_promise)]() mutable {
-        try {
-            Socket peer = listener.accept(2s);
-            peer.set_receive_timeout(500ms);
-            peer.set_send_timeout(500ms);
-            const auto hello = peer.receive_chunk(256U);
+    LoopbackTestServer server(
+        [](Socket& peer, const std::stop_token stop_token) {
+            const auto hello = receive_until_data(
+                peer, stop_token, std::chrono::steady_clock::now() + 2s);
             if (hello.status != ReceiveStatus::Data) {
                 throw std::runtime_error("server did not receive Hello");
             }
+            if (stop_token.stop_requested()) {
+                throw std::runtime_error("server stopped before malformed send");
+            }
             peer.send_all(monitor::protocol::encode(Message{Heartbeat{8}}));
-            promise.set_value();
-        } catch (...) {
-            promise.set_exception(std::current_exception());
-        }
-    });
+            return std::vector<Message>{};
+        });
 
     WinsockAgentSession session(AgentSessionConfig{
-        AgentEndpoint{"127.0.0.1", port}, test_hello(), 500ms, 200ms});
+        AgentEndpoint{"127.0.0.1", server.port()}, test_hello(), 500ms, 25ms});
+    const bool connected = session.connect();
+    EXPECT_TRUE(connected);
+    const auto server_result = server.finish();
+    EXPECT_TRUE(server_result.has_value());
+    if (!connected || !server_result.has_value()) {
+        return;
+    }
+
     const SteadyTime start{};
     AgentOrchestrator orchestrator(session, start, {});
 
     EXPECT_NO_THROW(orchestrator.tick(start));
-    EXPECT_TRUE(finish_server(server_result, server));
     EXPECT_EQ(orchestrator.state(), AgentConnectionState::Disconnected);
     EXPECT_NE(orchestrator.last_error().find("SetProfile"), std::string::npos);
     EXPECT_EQ(orchestrator.next_reconnect_deadline(), start + 250ms);
