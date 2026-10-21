@@ -8,20 +8,35 @@ The C++20 CMake/MSVC project currently includes:
 - `worker_capture`: validated owned BGRA frames, DXGI Desktop Duplication capture,
   GDI fallback capture, backend coordination and recovery, change detection, a
   latest-frame queue, capture profiles, and WIC scaling/JPEG encoding.
-- `WorkerAgent`: links the capture pipeline but intentionally does not start a
-  continuous capture loop yet.
+- `worker_transport`: single-owner agent sessions, finite-timeout Winsock
+  transport, reconnect/heartbeat scheduling, adaptive Grid rate control, and a
+  composable orchestration boundary with a latest-only encoded-frame handoff.
+- `WorkerAgent`: links the capture and transport primitives but intentionally
+  does not start a continuous application loop yet.
 - `Observer`: remains a stub executable.
 
 The protocol uses a fixed 12-byte, network-byte-order header. Each complete
 packet, including its header, is capped at 8 MiB; control payloads and UTF-8
-control strings use tighter limits.
+control strings use tighter limits. `Hello` carries a fixed 16-byte agent GUID,
+an employee name, and a hostname; both identity strings are validated UTF-8 and
+limited to 255 encoded bytes.
 
-The Grid profile limits output width to 480 pixels, uses JPEG quality 60, and
-defines adaptive scheduling bounds of 250-500 ms. The Focus profile limits
-output to 1280x720, uses JPEG quality 75, and defines a 250 ms interval. Stage 2
-applies only the image dimensions and quality; scheduling is not active. WIC
-clamps all requested JPEG quality values to the documented inclusive range
-1-100 and never upscales.
+The Grid profile limits output to 480x720 and adapts between 250-500 ms (4-2
+FPS) and JPEG quality 45-65. Overload evidence backs off immediately; four
+consecutive healthy samples are required for each cautious recovery step. The
+Focus profile is fixed at 1280x720, JPEG quality 75, and 250 ms unless an
+Observer `SetProfile` explicitly supplies values, which are clamped to the safe
+global bounds of 1-1280 width, 1-720 height, quality 45-75, and 250-500 ms.
+WIC still enforces its independent inclusive quality range of 1-100 and never
+upscales.
+
+Agent TCP sessions connect only to validated IPv4 endpoints, send `Hello`
+before any frame or heartbeat, incrementally decode only inbound `SetProfile`
+messages, and detect orderly close. Reads, writes, connection attempts, and
+tests use finite timeouts. Reconnect delays are 250, 500, 1000, then 1500 ms
+with a 1500 ms cap and reset after the `Hello` handshake. Heartbeats are due
+every two seconds. Frames use a capacity-one latest-only handoff; identity,
+profile control, and heartbeat traffic are never put in a generic frame queue.
 
 Capture is limited to the primary monitor and requires an interactive desktop.
 DXGI is preferred and GDI is used when DXGI is unavailable or recovering.
@@ -29,8 +44,9 @@ Capture is unavailable or may fail while the session is locked, on the secure
 UAC desktop, in non-interactive service sessions, or when desktop duplication
 is not supported. Secure desktop content is never captured.
 
-Networking, Observer UI, tray/configuration/autostart, archives, and load
-simulation are outside the current stage.
+The production Observer server/UI, tray/configuration/autostart, archives, load
+simulation, installer, authentication/encryption, and continuous app lifetime
+remain outside this stage.
 
 From PowerShell:
 
@@ -41,4 +57,5 @@ $cmake = 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7
 & $cmake --build build --config Release
 & "$([IO.Path]::GetDirectoryName($cmake))\ctest.exe" --test-dir build -C Debug --output-on-failure
 & "$([IO.Path]::GetDirectoryName($cmake))\ctest.exe" --test-dir build -C Release --output-on-failure
+& $cmake --build build --config Debug --target worker_common worker_capture worker_transport -- /p:RunCodeAnalysis=true
 ```

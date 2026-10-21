@@ -1,12 +1,10 @@
 #include "worker_agent/capture_profiles.h"
 
-#include <limits>
-
 namespace monitor::worker_agent {
 
 CaptureProfile grid_profile() noexcept {
     using namespace std::chrono_literals;
-    return {480U, std::numeric_limits<std::uint32_t>::max(), 60U, 250ms, 500ms};
+    return {480U, 720U, 60U, 250ms, 500ms};
 }
 
 CaptureProfile focus_profile() noexcept {

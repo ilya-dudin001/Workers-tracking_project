@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -20,6 +21,10 @@ inline constexpr std::uint32_t kMaxPayloadSize =
     static_cast<std::uint32_t>(kMaxPacketSize - kHeaderSize);
 inline constexpr std::uint32_t kMaxControlPayloadSize = 2048;
 inline constexpr std::size_t kMaxControlStringBytes = 1024;
+inline constexpr std::size_t kAgentGuidSize = 16;
+inline constexpr std::size_t kMaxIdentityStringBytes = 255;
+
+using AgentGuid = std::array<std::uint8_t, kAgentGuidSize>;
 
 enum class MessageType : std::uint16_t {
     Hello = 1,
@@ -30,7 +35,9 @@ enum class MessageType : std::uint16_t {
 };
 
 struct Hello {
-    std::string name;
+    AgentGuid agent_guid{};
+    std::string employee_name;
+    std::string hostname;
     bool operator==(const Hello&) const = default;
 };
 

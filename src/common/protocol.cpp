@@ -66,8 +66,10 @@ bool is_valid_utf8(const std::string_view text) {
     return true;
 }
 
-void append_control_string(Bytes& output, const std::string_view text) {
-    if (text.size() > kMaxControlStringBytes || !is_valid_utf8(text)) {
+void append_control_string(Bytes& output,
+                           const std::string_view text,
+                           const std::size_t maximum_size = kMaxControlStringBytes) {
+    if (text.size() > maximum_size || !is_valid_utf8(text)) {
         throw ProtocolError("invalid control string");
     }
     append_u16(output, static_cast<std::uint16_t>(text.size()));
@@ -115,9 +117,9 @@ public:
         return value;
     }
 
-    std::string control_string() {
+    std::string control_string(const std::size_t maximum_size = kMaxControlStringBytes) {
         const std::size_t size = u16();
-        if (size > kMaxControlStringBytes) {
+        if (size > maximum_size) {
             throw ProtocolError("control string exceeds limit");
         }
         const Bytes raw = bytes(size);
@@ -170,7 +172,10 @@ Bytes encode_payload(const Message& message) {
         [&payload](const auto& value) {
             using T = std::decay_t<decltype(value)>;
             if constexpr (std::is_same_v<T, Hello>) {
-                append_control_string(payload, value.name);
+                payload.insert(payload.end(), value.agent_guid.begin(), value.agent_guid.end());
+                append_control_string(
+                    payload, value.employee_name, kMaxIdentityStringBytes);
+                append_control_string(payload, value.hostname, kMaxIdentityStringBytes);
             } else if constexpr (std::is_same_v<T, Frame>) {
                 if (value.encoded_image.size() > kMaxPayloadSize - kFrameMetadataSize) {
                     throw ProtocolError("frame is too large");
@@ -255,7 +260,14 @@ Message decode_packet(const std::span<const std::uint8_t> packet) {
     Message message;
     switch (header.type) {
         case MessageType::Hello:
-            message = Hello{reader.control_string()};
+            {
+                const Bytes guid_bytes = reader.bytes(kAgentGuidSize);
+                AgentGuid guid{};
+                std::copy(guid_bytes.begin(), guid_bytes.end(), guid.begin());
+                message = Hello{guid,
+                                reader.control_string(kMaxIdentityStringBytes),
+                                reader.control_string(kMaxIdentityStringBytes)};
+            }
             break;
         case MessageType::Frame: {
             const std::uint64_t sequence = reader.u64();

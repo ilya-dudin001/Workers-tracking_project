@@ -17,11 +17,14 @@ target_sources(worker_common
         FILES
             src/common/protocol.h
             src/common/stream_decoder.h
+            src/common/winsock_socket.h
     PRIVATE
         src/common/protocol.cpp
         src/common/stream_decoder.cpp
+        src/common/winsock_socket.cpp
 )
 target_include_directories(worker_common PUBLIC src)
+target_link_libraries(worker_common PUBLIC ws2_32)
 enable_strict_warnings(worker_common)
 
 add_library(worker_capture)
@@ -56,8 +59,28 @@ target_include_directories(worker_capture PUBLIC src)
 target_link_libraries(worker_capture PRIVATE d3d11 dxgi windowscodecs gdi32 ole32)
 enable_strict_warnings(worker_capture)
 
+add_library(worker_transport)
+target_sources(worker_transport
+    PUBLIC
+        FILE_SET HEADERS
+        BASE_DIRS src
+        FILES
+            src/worker_agent/adaptive_rate_controller.h
+            src/worker_agent/agent_orchestrator.h
+            src/worker_agent/agent_session.h
+            src/worker_agent/transport_schedulers.h
+    PRIVATE
+        src/worker_agent/adaptive_rate_controller.cpp
+        src/worker_agent/agent_orchestrator.cpp
+        src/worker_agent/agent_session.cpp
+        src/worker_agent/transport_schedulers.cpp
+)
+target_include_directories(worker_transport PUBLIC src)
+target_link_libraries(worker_transport PUBLIC worker_common worker_capture)
+enable_strict_warnings(worker_transport)
+
 add_executable(WorkerAgent WIN32 src/worker_agent/main.cpp)
-target_link_libraries(WorkerAgent PRIVATE worker_common worker_capture)
+target_link_libraries(WorkerAgent PRIVATE worker_common worker_capture worker_transport)
 enable_strict_warnings(WorkerAgent)
 
 add_executable(Observer WIN32 src/observer/main.cpp)
@@ -76,14 +99,16 @@ if(BUILD_TESTING)
     FetchContent_MakeAvailable(googletest)
 
     add_executable(common_tests
+        tests/agent_control_tests.cpp
         tests/capture_coordinator_tests.cpp
         tests/capture_core_tests.cpp
         tests/image_processor_tests.cpp
         tests/protocol_tests.cpp
         tests/stream_decoder_tests.cpp
+        tests/winsock_integration_tests.cpp
         tests/windows_capture_tests.cpp
     )
-    target_link_libraries(common_tests PRIVATE worker_common worker_capture GTest::gtest_main)
+    target_link_libraries(common_tests PRIVATE worker_common worker_capture worker_transport GTest::gtest_main)
     enable_strict_warnings(common_tests)
 
     include(GoogleTest)

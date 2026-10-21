@@ -11,6 +11,7 @@ struct CaptureProfile {
     std::uint8_t jpeg_quality;
     std::chrono::milliseconds minimum_interval;
     std::chrono::milliseconds maximum_interval;
+    bool operator==(const CaptureProfile&) const = default;
 };
 
 [[nodiscard]] CaptureProfile grid_profile() noexcept;

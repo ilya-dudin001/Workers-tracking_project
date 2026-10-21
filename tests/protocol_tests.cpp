@@ -49,7 +49,29 @@ T round_trip(const T& message) {
 }
 
 TEST(ProtocolRoundTrip, Hello) {
-    EXPECT_EQ(round_trip(Hello{"worker-\xE2\x98\x83"}), (Hello{"worker-\xE2\x98\x83"}));
+    const Hello hello{
+        {0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+         0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF},
+        "worker-\xE2\x98\x83",
+        "host-\xE6\x9D\xB1"};
+    EXPECT_EQ(round_trip(hello), hello);
+}
+
+TEST(ProtocolWireFormat, HelloStartsWithFixedGuidThenLengthPrefixedStrings) {
+    const Hello hello{
+        {0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+         0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F},
+        "Ada",
+        "desk"};
+    const Bytes packet = monitor::protocol::encode(Message{hello});
+    const auto payload = std::span(packet).subspan(monitor::protocol::kHeaderSize);
+
+    ASSERT_EQ(payload.size(), 16U + 2U + 3U + 2U + 4U);
+    EXPECT_TRUE(std::equal(hello.agent_guid.begin(), hello.agent_guid.end(), payload.begin()));
+    EXPECT_EQ(payload[16], 0U);
+    EXPECT_EQ(payload[17], 3U);
+    EXPECT_EQ(payload[21], 0U);
+    EXPECT_EQ(payload[22], 4U);
 }
 
 TEST(ProtocolRoundTrip, Frame) {
@@ -141,20 +163,23 @@ TEST(ProtocolValidation, RejectsFrameWhoseTotalPacketExceedsLimit) {
 
 TEST(ProtocolValidation, RejectsOversizedControlString) {
     EXPECT_THROW(static_cast<void>(monitor::protocol::encode(
-                     Message{Hello{std::string(monitor::protocol::kMaxControlStringBytes + 1, 'a')}})),
+                     Message{Hello{{}, std::string(
+                                               monitor::protocol::kMaxControlStringBytes + 1, 'a'),
+                                         "host"}})),
                  ProtocolError);
 }
 
 TEST(ProtocolValidation, RejectsInvalidUtf8) {
     EXPECT_THROW(static_cast<void>(
-                     monitor::protocol::encode(Message{Hello{std::string("\xC3\x28", 2)}})),
+                     monitor::protocol::encode(
+                         Message{Hello{{}, std::string("\xC3\x28", 2), "host"}})),
                  ProtocolError);
 }
 
 TEST(ProtocolValidation, RejectsInvalidUtf8FromWire) {
-    Bytes packet = monitor::protocol::encode(Message{Hello{"ok"}});
-    packet[monitor::protocol::kHeaderSize + 2] = 0xC3;
-    packet[monitor::protocol::kHeaderSize + 3] = 0x28;
+    Bytes packet = monitor::protocol::encode(Message{Hello{{}, "ok", "host"}});
+    packet[monitor::protocol::kHeaderSize + 18] = 0xC3;
+    packet[monitor::protocol::kHeaderSize + 19] = 0x28;
 
     EXPECT_THROW(static_cast<void>(monitor::protocol::decode_packet(packet)), ProtocolError);
 }

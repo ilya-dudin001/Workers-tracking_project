@@ -18,7 +18,8 @@ using monitor::protocol::ProtocolError;
 using monitor::protocol::StreamDecoder;
 
 TEST(StreamDecoder, AcceptsPacketByteByByte) {
-    const Bytes packet = monitor::protocol::encode(Message{Hello{"worker"}});
+    const Hello hello{{1}, "worker", "host"};
+    const Bytes packet = monitor::protocol::encode(Message{hello});
     StreamDecoder decoder;
     std::vector<Message> decoded;
 
@@ -28,7 +29,7 @@ TEST(StreamDecoder, AcceptsPacketByteByByte) {
     }
 
     ASSERT_EQ(decoded.size(), 1U);
-    EXPECT_EQ(std::get<Hello>(decoded.front()), (Hello{"worker"}));
+    EXPECT_EQ(std::get<Hello>(decoded.front()), hello);
     EXPECT_EQ(decoder.buffered_size(), 0U);
 }
 
@@ -62,7 +63,7 @@ TEST(StreamDecoder, ProducesMultipleMessagesFromOneFeed) {
 
 TEST(StreamDecoder, ProducesCompleteMessageAndPreservesNextPartialMessage) {
     const Bytes first = monitor::protocol::encode(Message{Heartbeat{1}});
-    const Bytes second = monitor::protocol::encode(Message{Hello{"next"}});
+    const Bytes second = monitor::protocol::encode(Message{Hello{{2}, "next", "host"}});
     Bytes chunk = first;
     chunk.insert(chunk.end(), second.begin(), second.begin() + 5);
     StreamDecoder decoder;
@@ -73,7 +74,7 @@ TEST(StreamDecoder, ProducesCompleteMessageAndPreservesNextPartialMessage) {
     EXPECT_EQ(decoder.buffered_size(), 5U);
     const auto remainder = decoder.feed(std::span(second).subspan(5));
     ASSERT_EQ(remainder.size(), 1U);
-    EXPECT_EQ(std::get<Hello>(remainder.front()).name, "next");
+    EXPECT_EQ(std::get<Hello>(remainder.front()).employee_name, "next");
 }
 
 TEST(StreamDecoder, MalformedHeaderPoisonsDecoder) {
