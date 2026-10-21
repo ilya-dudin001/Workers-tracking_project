@@ -1,0 +1,15 @@
+# CMake build outputs
+/build/
+/out/
+
+# Visual Studio and editor-local state
+/.vs/
+/.vscode/
+*.user
+
+# Runtime logs and generated packages
+/logs/
+/dist/
+
+# Superpowers execution scratch data
+/.superpowers/
