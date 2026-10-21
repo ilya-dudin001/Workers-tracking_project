@@ -14,7 +14,7 @@ namespace monitor::protocol {
 using Bytes = std::vector<std::uint8_t>;
 
 inline constexpr std::uint32_t kMagic = 0x5754524B;
-inline constexpr std::uint16_t kVersion = 1;
+inline constexpr std::uint16_t kVersion = 2;
 inline constexpr std::size_t kHeaderSize = 12;
 inline constexpr std::size_t kMaxPacketSize = 8U * 1024U * 1024U;
 inline constexpr std::uint32_t kMaxPayloadSize =
@@ -46,6 +46,7 @@ struct Frame {
     std::uint32_t width;
     std::uint32_t height;
     Bytes encoded_image;
+    std::uint64_t captured_at_ms{};
     bool operator==(const Frame&) const = default;
 };
 

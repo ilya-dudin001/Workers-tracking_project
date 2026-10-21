@@ -247,18 +247,63 @@ void Socket::set_send_timeout(const std::chrono::milliseconds timeout) {
 }
 
 void Socket::send_all(const std::span<const std::uint8_t> bytes) {
+    send_all(bytes, std::chrono::seconds(30), {});
+}
+
+void Socket::send_all(const std::span<const std::uint8_t> bytes,
+                      const std::chrono::milliseconds timeout,
+                      const std::stop_token stop_token) {
+    require_positive_timeout(timeout);
+    const SOCKET socket = as_socket(native());
+    u_long nonblocking = 1;
+    if (ioctlsocket(socket, FIONBIO, &nonblocking) == SOCKET_ERROR) {
+        throw_socket_error("ioctlsocket");
+    }
+    struct RestoreBlocking {
+        SOCKET socket;
+        ~RestoreBlocking() {
+            u_long blocking = 0;
+            static_cast<void>(ioctlsocket(socket, FIONBIO, &blocking));
+        }
+    } restore{socket};
+
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
     std::size_t sent = 0;
     while (sent < bytes.size()) {
+        if (stop_token.stop_requested()) {
+            throw std::runtime_error("send cancelled");
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            throw std::runtime_error("send timed out");
+        }
         const std::size_t remaining = bytes.size() - sent;
         const int chunk_size = static_cast<int>(
             std::min<std::size_t>(remaining, static_cast<std::size_t>(INT_MAX)));
         const int result =
-            ::send(as_socket(native()),
+            ::send(socket,
                    reinterpret_cast<const char*>(bytes.data() + sent),
                    chunk_size,
                    0);
         if (result == SOCKET_ERROR) {
-            throw_socket_error("send");
+            const int error = WSAGetLastError();
+            if (error != WSAEWOULDBLOCK) {
+                throw_socket_error("send");
+            }
+            const auto remaining_time =
+                std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+            const auto slice =
+                std::clamp(remaining_time, std::chrono::milliseconds{1},
+                           std::chrono::milliseconds{50});
+            timeval wait = to_timeval(slice);
+            fd_set writable;
+            FD_ZERO(&writable);
+            FD_SET(socket, &writable);
+            const int selected = select(0, nullptr, &writable, nullptr, &wait);
+            if (selected == SOCKET_ERROR) {
+                throw_socket_error("select");
+            }
+            continue;
         }
         if (result == 0) {
             throw std::runtime_error("send returned zero");

@@ -249,16 +249,47 @@ public:
 TEST(AgentWorkerCore, UnchangedFrameIsNotEncodedOrSentAndNewestReplacesOld) {
     auto transport = std::make_unique<FakeTransport>();
     auto* transport_view = transport.get();
+    transport_view->connect_result = false;
     auto pipeline = std::make_unique<FakePipeline>();
     auto* pipeline_view = pipeline.get();
     AgentWorkerCore worker(std::move(transport), std::move(pipeline), {});
 
     worker.step({});
     worker.step(250ms);
-    pipeline_view->changed = false;
     worker.step(500ms);
-    EXPECT_EQ(pipeline_view->encoded_frames, 1U);
+    transport_view->connect_result = true;
+    worker.step(750ms);
+    pipeline_view->changed = false;
+    worker.step(1000ms);
+    EXPECT_GE(pipeline_view->encoded_frames, 2U);
     ASSERT_EQ(transport_view->sent_sequences.size(), 1U);
+    EXPECT_EQ(transport_view->sent_sequences.front(), pipeline_view->next_sequence - 1);
+}
+
+TEST(AgentWorkerCore, RejectsNullDependenciesBeforeDereference) {
+    auto pipeline = std::make_unique<FakePipeline>();
+    EXPECT_THROW(AgentWorkerCore(nullptr, std::move(pipeline), {}), std::invalid_argument);
+
+    auto transport = std::make_unique<FakeTransport>();
+    EXPECT_THROW(AgentWorkerCore(std::move(transport), nullptr, {}), std::invalid_argument);
+}
+
+TEST(AgentWorkerCore, AdaptiveCongestionUpdatesEncoderProfile) {
+    auto transport = std::make_unique<FakeTransport>();
+    auto* transport_view = transport.get();
+    transport_view->connect_result = false;
+    auto pipeline = std::make_unique<FakePipeline>();
+    auto* pipeline_view = pipeline.get();
+    AgentWorkerCore worker(std::move(transport), std::move(pipeline), {});
+
+    worker.step(0ms);
+    worker.step(250ms);
+    worker.step(500ms);
+    const auto initial_quality = pipeline_view->quality;
+    transport_view->connect_result = true;
+    worker.step(750ms);
+
+    EXPECT_LT(pipeline_view->quality, initial_quality);
 }
 
 TEST(AgentWorkerCore, FocusCommandChangesEncoderTargetAndTransportRecovers) {

@@ -18,11 +18,13 @@ bool WinsockAgentSession::connect() {
     try {
         socket_ = net::Socket::connect_ipv4(config_.endpoint.ipv4_address,
                                             config_.endpoint.port,
-                                            config_.connect_timeout);
+                                            config_.connect_timeout,
+                                            config_.stop_token);
         socket_.set_receive_timeout(config_.receive_timeout);
         socket_.set_send_timeout(config_.send_timeout);
         // Online begins only after the identity packet has been fully written.
-        socket_.send_all(protocol::encode(protocol::Message{config_.hello}));
+        socket_.send_all(protocol::encode(protocol::Message{config_.hello}),
+                         config_.send_timeout, config_.stop_token);
         state_ = AgentConnectionState::Online;
         return true;
     } catch (const std::exception& error) {
@@ -94,7 +96,8 @@ bool WinsockAgentSession::send_message(const protocol::Message& message) {
         return false;
     }
     try {
-        socket_.send_all(protocol::encode(message));
+        socket_.send_all(protocol::encode(message), config_.send_timeout,
+                         config_.stop_token);
         return true;
     } catch (const std::exception& error) {
         fail(error.what());

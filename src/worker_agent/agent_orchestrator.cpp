@@ -61,18 +61,27 @@ void AgentOrchestrator::tick(const SteadyTime now) {
     }
 
     if (pending_frame_) {
+        const CaptureProfile previous_profile = rate_controller_.current_profile();
         const SteadyTime send_start = clock_();
         if (!transport_.send_frame(*pending_frame_)) {
             rate_controller_.observe(
                 {rate_controller_.current_profile().minimum_interval,
                  frame_replaced_,
                  true});
+            if (rate_controller_.current_profile() != previous_profile &&
+                profile_callback_) {
+                profile_callback_(rate_controller_.current_profile());
+            }
             schedule_reconnect(now);
             return;
         }
         const auto send_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
             clock_() - send_start);
         rate_controller_.observe({send_duration, frame_replaced_, false});
+        if (rate_controller_.current_profile() != previous_profile &&
+            profile_callback_) {
+            profile_callback_(rate_controller_.current_profile());
+        }
         pending_frame_.reset();
         frame_replaced_ = false;
     }

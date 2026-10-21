@@ -75,7 +75,8 @@ TEST(ProtocolWireFormat, HelloStartsWithFixedGuidThenLengthPrefixedStrings) {
 }
 
 TEST(ProtocolRoundTrip, Frame) {
-    const Frame frame{42, 1920, 1080, Bytes{0xFF, 0xD8, 0x01, 0xFF, 0xD9}};
+    const Frame frame{42, 1920, 1080, Bytes{0xFF, 0xD8, 0x01, 0xFF, 0xD9},
+                      9'876'543'210ULL};
     EXPECT_EQ(round_trip(frame), frame);
 }
 
@@ -95,7 +96,7 @@ TEST(ProtocolRoundTrip, RenameAck) {
 TEST(ProtocolWireFormat, HeaderUsesNetworkByteOrder) {
     const Bytes packet = monitor::protocol::encode(Message{Heartbeat{0x0102030405060708ULL}});
     const std::array<std::uint8_t, monitor::protocol::kHeaderSize> expected{
-        0x57, 0x54, 0x52, 0x4B, 0x00, 0x01, 0x00, 0x03, 0x00, 0x00, 0x00, 0x08};
+        0x57, 0x54, 0x52, 0x4B, 0x00, 0x02, 0x00, 0x03, 0x00, 0x00, 0x00, 0x08};
     EXPECT_TRUE(std::equal(expected.begin(), expected.end(), packet.begin()));
     EXPECT_EQ(std::vector<std::uint8_t>(packet.begin() + monitor::protocol::kHeaderSize, packet.end()),
               (Bytes{1, 2, 3, 4, 5, 6, 7, 8}));
@@ -112,7 +113,7 @@ TEST(ProtocolWireFormat, DecodesKnownNonSymmetricUint64InNetworkOrder) {
 
 TEST(ProtocolValidation, RejectsUnknownVersion) {
     Bytes packet = monitor::protocol::encode(Message{Heartbeat{1}});
-    packet[5] = 2;
+    packet[5] = 0x7F;
     EXPECT_THROW(static_cast<void>(monitor::protocol::decode_packet(packet)), ProtocolError);
 }
 
@@ -151,7 +152,7 @@ TEST(ProtocolValidation, RejectsGlobalPacketLimitInHeader) {
 }
 
 TEST(ProtocolValidation, RejectsFrameWhoseTotalPacketExceedsLimit) {
-    constexpr std::size_t frame_metadata_size = 20;
+    constexpr std::size_t frame_metadata_size = 28;
     const std::size_t oversized_image_size =
         monitor::protocol::kMaxPacketSize - monitor::protocol::kHeaderSize -
         frame_metadata_size + 1;

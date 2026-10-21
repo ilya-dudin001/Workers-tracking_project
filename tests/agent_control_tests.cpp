@@ -174,8 +174,8 @@ TEST(AgentOrchestrator, KeepsOnlyNewestFrameAndSendsControlIndependently) {
 
     transport.commands.push_back(SetProfile{400, 55, 480, 270});
     orchestrator.tick(SteadyTime{} + 1ms);
-    ASSERT_EQ(applied.size(), 1U);
-    EXPECT_EQ(applied.front(), orchestrator.current_profile());
+    ASSERT_GE(applied.size(), 2U);
+    EXPECT_EQ(applied.back(), orchestrator.current_profile());
     EXPECT_EQ(orchestrator.current_profile().minimum_interval, 400ms);
 }
 

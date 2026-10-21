@@ -7,7 +7,7 @@
 namespace monitor::protocol {
 namespace {
 
-constexpr std::size_t kFrameMetadataSize = 20;
+constexpr std::size_t kFrameMetadataSize = 28;
 
 void append_u16(Bytes& output, const std::uint16_t value) {
     output.push_back(static_cast<std::uint8_t>(value >> 8));
@@ -185,6 +185,7 @@ Bytes encode_payload(const Message& message) {
                 append_u32(payload, value.width);
                 append_u32(payload, value.height);
                 append_u32(payload, static_cast<std::uint32_t>(value.encoded_image.size()));
+                append_u64(payload, value.captured_at_ms);
                 payload.insert(payload.end(), value.encoded_image.begin(), value.encoded_image.end());
             } else if constexpr (std::is_same_v<T, Heartbeat>) {
                 append_u64(payload, value.timestamp_ms);
@@ -274,7 +275,8 @@ Message decode_packet(const std::span<const std::uint8_t> packet) {
             const std::uint32_t width = reader.u32();
             const std::uint32_t height = reader.u32();
             const std::uint32_t image_size = reader.u32();
-            message = Frame{sequence, width, height, reader.bytes(image_size)};
+            const std::uint64_t captured_at_ms = reader.u64();
+            message = Frame{sequence, width, height, reader.bytes(image_size), captured_at_ms};
             break;
         }
         case MessageType::Heartbeat:

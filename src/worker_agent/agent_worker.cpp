@@ -14,6 +14,15 @@ namespace {
 
 using namespace std::chrono_literals;
 
+template <typename T>
+std::unique_ptr<T> require_dependency(std::unique_ptr<T> value,
+                                      const char* message) {
+    if (!value) {
+        throw std::invalid_argument(message);
+    }
+    return value;
+}
+
 class WindowsWorkerPipeline final : public IWorkerPipeline {
 public:
     WindowsWorkerPipeline() : coordinator_(factory_, 2s), profile_(grid_profile()) {}
@@ -34,8 +43,8 @@ public:
         const EncodedImage encoded =
             processor_.encode_jpeg(*captured.frame, profile_.max_width, profile_.max_height,
                                    profile_.jpeg_quality);
-        result = protocol::Frame{captured.frame->sequence, encoded.width, encoded.height,
-                                 encoded.jpeg};
+        result = protocol::Frame{++sequence_, encoded.width, encoded.height, encoded.jpeg,
+                                 captured.frame->captured_at_ms};
         return true;
     }
 
@@ -49,6 +58,7 @@ private:
     ChangeDetector detector_;
     WicImageProcessor processor_;
     CaptureProfile profile_;
+    std::uint64_t sequence_{};
     std::chrono::steady_clock::time_point start_{std::chrono::steady_clock::now()};
 };
 
@@ -69,16 +79,15 @@ WorkerState public_state(const AgentConnectionState state) {
 AgentWorkerCore::AgentWorkerCore(std::unique_ptr<AgentTransport> transport,
                                  std::unique_ptr<IWorkerPipeline> pipeline,
                                  WorkerStateCallback callback)
-    : transport_(std::move(transport)),
-      pipeline_(std::move(pipeline)),
+    : transport_(require_dependency(std::move(transport),
+                                    "Worker transport is required")),
+      pipeline_(require_dependency(std::move(pipeline),
+                                   "Worker pipeline is required")),
       callback_(std::move(callback)),
       orchestrator_(*transport_, start_,
                     [this](const CaptureProfile& profile) {
                         pipeline_->apply_profile(profile);
                     }) {
-    if (!transport_ || !pipeline_) {
-        throw std::invalid_argument("Worker dependencies are required");
-    }
     pipeline_->apply_profile(orchestrator_.current_profile());
 }
 
@@ -177,7 +186,8 @@ void run_agent_worker(const AgentConfig& config,
             {config.agent_guid, config.employee_name, runtime_hostname_utf8()},
             1000ms,
             50ms,
-            1000ms};
+            1000ms,
+            stop};
         auto transport = std::make_unique<WinsockAgentSession>(std::move(session_config));
         auto pipeline = std::make_unique<WindowsWorkerPipeline>();
         AgentWorkerCore worker(std::move(transport), std::move(pipeline), callback);

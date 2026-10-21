@@ -5,6 +5,7 @@
 
 #define NOMINMAX
 #include <windows.h>
+#include <windowsx.h>
 #include <commctrl.h>
 #include <shellapi.h>
 
@@ -102,6 +103,7 @@ struct SetupContext {
     AgentConfig working;
     std::optional<AgentConfig> result;
     bool done{};
+    UINT dpi{96};
 };
 
 LRESULT CALLBACK setup_window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
@@ -113,11 +115,15 @@ LRESULT CALLBACK setup_window_proc(HWND window, UINT message, WPARAM wparam, LPA
         SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(context));
     }
     if (message == WM_CREATE && context != nullptr) {
+        context->dpi = GetDpiForWindow(window);
+        const auto scale = [context](const int value) {
+            return MulDiv(value, static_cast<int>(context->dpi), 96);
+        };
         const HFONT font = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
         auto create_control = [&](const wchar_t* type, const wchar_t* text, DWORD style, int x,
                                   int y, int width, int height, int identifier) {
-            HWND control = CreateWindowExW(0, type, text, WS_CHILD | WS_VISIBLE | style, x, y,
-                                           width, height, window,
+            HWND control = CreateWindowExW(0, type, text, WS_CHILD | WS_VISIBLE | style,
+                                           scale(x), scale(y), scale(width), scale(height), window,
                                            reinterpret_cast<HMENU>(
                                                static_cast<INT_PTR>(identifier)),
                                            GetModuleHandleW(nullptr), nullptr);
@@ -200,6 +206,36 @@ LRESULT CALLBACK setup_window_proc(HWND window, UINT message, WPARAM wparam, LPA
         DestroyWindow(window);
         return 0;
     }
+    if (message == WM_DPICHANGED && context != nullptr) {
+        const UINT previous_dpi = context->dpi;
+        const UINT next_dpi = HIWORD(wparam);
+        const auto* suggested = reinterpret_cast<const RECT*>(lparam);
+        SetWindowPos(window, nullptr, suggested->left, suggested->top,
+                     suggested->right - suggested->left,
+                     suggested->bottom - suggested->top,
+                     SWP_NOACTIVATE | SWP_NOZORDER);
+        for (HWND child = GetWindow(window, GW_CHILD); child != nullptr;
+             child = GetWindow(child, GW_HWNDNEXT)) {
+            RECT rect{};
+            GetWindowRect(child, &rect);
+            MapWindowPoints(nullptr, window, reinterpret_cast<POINT*>(&rect), 2);
+            SetWindowPos(child, nullptr,
+                         MulDiv(rect.left, static_cast<int>(next_dpi),
+                                static_cast<int>(previous_dpi)),
+                         MulDiv(rect.top, static_cast<int>(next_dpi),
+                                static_cast<int>(previous_dpi)),
+                         MulDiv(rect.right - rect.left, static_cast<int>(next_dpi),
+                                static_cast<int>(previous_dpi)),
+                         MulDiv(rect.bottom - rect.top, static_cast<int>(next_dpi),
+                                static_cast<int>(previous_dpi)),
+                         SWP_NOACTIVATE | SWP_NOZORDER);
+        }
+        context->dpi = next_dpi;
+        return 0;
+    }
+    if (message == WM_NCDESTROY) {
+        SetWindowLongPtrW(window, GWLP_USERDATA, 0);
+    }
     return DefWindowProcW(window, message, wparam, lparam);
 }
 
@@ -218,15 +254,42 @@ std::optional<AgentConfig> show_setup(const HWND owner, const AgentConfig& initi
     ShowWindow(window, SW_SHOW);
     UpdateWindow(window);
     MSG message{};
-    while (!context.done && GetMessageW(&message, nullptr, 0, 0) > 0) {
+    bool repost_quit = false;
+    int quit_code = 0;
+    while (!context.done) {
+        const BOOL status = GetMessageW(&message, nullptr, 0, 0);
+        if (status == -1) {
+            if (IsWindow(window)) {
+                DestroyWindow(window);
+            }
+            if (owner != nullptr) {
+                EnableWindow(owner, TRUE);
+            }
+            throw std::runtime_error("Settings message loop failed");
+        }
+        if (status == 0) {
+            repost_quit = true;
+            quit_code = static_cast<int>(message.wParam);
+            context.done = true;
+            if (IsWindow(window)) {
+                DestroyWindow(window);
+            }
+            break;
+        }
         if (!IsDialogMessageW(window, &message)) {
             TranslateMessage(&message);
             DispatchMessageW(&message);
         }
     }
+    if (IsWindow(window)) {
+        DestroyWindow(window);
+    }
     if (owner != nullptr) {
         EnableWindow(owner, TRUE);
         SetForegroundWindow(owner);
+    }
+    if (repost_quit) {
+        PostQuitMessage(quit_code);
     }
     return context.result;
 }
@@ -289,12 +352,13 @@ public:
 
     LRESULT handle(UINT message, WPARAM wparam, LPARAM lparam) {
         if (message == taskbar_created_) {
+            tray_added_ = false;
             add_tray_icon();
             return 0;
         }
         switch (message) {
             case kTrayMessage:
-                on_tray(lparam);
+                on_tray(wparam, lparam);
                 return 0;
             case kWorkerStateMessage: {
                 std::unique_ptr<WorkerNotice> notice(
@@ -316,7 +380,6 @@ public:
                 on_command(LOWORD(wparam));
                 return 0;
             case WM_QUERYENDSESSION:
-                worker_.stop();
                 return TRUE;
             case WM_ENDSESSION:
                 if (wparam != FALSE) {
@@ -325,6 +388,7 @@ public:
                 }
                 return 0;
             case WM_DESTROY:
+                shutdown();
                 PostQuitMessage(0);
                 return 0;
             default:
@@ -357,7 +421,7 @@ private:
         return LoadIconW(nullptr, MAKEINTRESOURCEW(identifier));
     }
 
-    void add_tray_icon() {
+    bool add_tray_icon() {
         NOTIFYICONDATAW data{};
         data.cbSize = sizeof(data);
         data.hWnd = window_;
@@ -368,10 +432,20 @@ private:
         const std::wstring tooltip =
             L"Workers Tracking — мониторинг экрана активен — " + state_text();
         wcsncpy_s(data.szTip, tooltip.c_str(), _TRUNCATE);
-        Shell_NotifyIconW(NIM_ADD, &data);
+        if (Shell_NotifyIconW(NIM_ADD, &data) == FALSE) {
+            tray_added_ = false;
+            log_.write("Could not add notification icon");
+            return false;
+        }
         data.uVersion = NOTIFYICON_VERSION_4;
-        Shell_NotifyIconW(NIM_SETVERSION, &data);
+        if (Shell_NotifyIconW(NIM_SETVERSION, &data) == FALSE) {
+            static_cast<void>(Shell_NotifyIconW(NIM_DELETE, &data));
+            tray_added_ = false;
+            log_.write("Could not set notification icon version");
+            return false;
+        }
         tray_added_ = true;
+        return true;
     }
 
     void update_tray_icon() {
@@ -402,11 +476,17 @@ private:
         tray_added_ = false;
     }
 
-    void on_tray(const LPARAM event) {
-        if (LOWORD(event) == WM_LBUTTONUP || LOWORD(event) == WM_LBUTTONDBLCLK) {
+    void on_tray(const WPARAM coordinates, const LPARAM event_data) {
+        const UINT event = LOWORD(event_data);
+        if (event == WM_LBUTTONUP || event == WM_LBUTTONDBLCLK ||
+            event == NIN_SELECT || event == NIN_KEYSELECT) {
             show_status();
-        } else if (LOWORD(event) == WM_RBUTTONUP || LOWORD(event) == WM_CONTEXTMENU) {
-            show_menu();
+        } else if (event == WM_RBUTTONUP || event == WM_CONTEXTMENU) {
+            POINT anchor{GET_X_LPARAM(coordinates), GET_Y_LPARAM(coordinates)};
+            if (anchor.x == 0 && anchor.y == 0) {
+                GetCursorPos(&anchor);
+            }
+            show_menu(anchor);
         }
     }
 
@@ -418,16 +498,16 @@ private:
         MessageBoxW(window_, text.c_str(), L"Workers Tracking", MB_OK | MB_ICONINFORMATION);
     }
 
-    void show_menu() {
-        POINT cursor{};
-        GetCursorPos(&cursor);
+    void show_menu(const POINT cursor) {
         HMENU menu = CreatePopupMenu();
         const std::wstring summary = L"Мониторинг активен — " + state_text();
         AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, summary.c_str());
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(menu, MF_STRING, kCommandSettings, L"Настройки…");
+        const bool actual_autostart =
+            current_ && autostart_.is_enabled(executable_path());
         AppendMenuW(menu,
-                    MF_STRING | (current_ && current_->autostart ? MF_CHECKED : MF_UNCHECKED),
+                    MF_STRING | (actual_autostart ? MF_CHECKED : MF_UNCHECKED),
                     kCommandAutostart, L"Запускать с Windows");
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(menu, MF_STRING, kCommandExit, L"Выход");
@@ -474,14 +554,17 @@ private:
         if (!save_error.empty()) {
             const std::string rollback_error =
                 autostart_.set_enabled(previous_autostart, executable);
-            if (!rollback_error.empty()) {
-                log_.write(rollback_error);
-            }
             if (current_) {
                 current_->autostart = autostart_.is_enabled(executable);
-                static_cast<void>(store_.save(*current_));
             }
-            MessageBoxW(window_, widen(save_error).c_str(), L"Ошибка сохранения",
+            std::string combined = save_error;
+            if (!rollback_error.empty()) {
+                combined +=
+                    "\nAutostart rollback failed; check the Windows startup setting: " +
+                    rollback_error;
+                log_.write(combined);
+            }
+            MessageBoxW(window_, widen(combined).c_str(), L"Ошибка сохранения",
                         MB_OK | MB_ICONERROR);
             return false;
         }
@@ -510,7 +593,19 @@ private:
         }
         shutting_down_ = true;
         worker_.stop();
+        drain_worker_notices();
         remove_tray_icon();
+    }
+
+    void drain_worker_notices() noexcept {
+        if (window_ == nullptr) {
+            return;
+        }
+        MSG message{};
+        while (PeekMessageW(&message, window_, kWorkerStateMessage,
+                            kWorkerStateMessage, PM_REMOVE)) {
+            delete reinterpret_cast<WorkerNotice*>(message.lParam);
+        }
     }
 
     HINSTANCE instance_{};

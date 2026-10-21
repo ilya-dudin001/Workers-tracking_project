@@ -58,6 +58,9 @@ public:
     void set_receive_timeout(std::chrono::milliseconds timeout);
     void set_send_timeout(std::chrono::milliseconds timeout);
     void send_all(std::span<const std::uint8_t> bytes);
+    void send_all(std::span<const std::uint8_t> bytes,
+                  std::chrono::milliseconds timeout,
+                  std::stop_token stop_token);
     [[nodiscard]] ReceiveResult receive_chunk(std::size_t maximum_bytes);
     void shutdown() noexcept;
     void close() noexcept;

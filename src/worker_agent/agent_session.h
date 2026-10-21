@@ -28,6 +28,7 @@ struct AgentSessionConfig {
     std::chrono::milliseconds connect_timeout{1000};
     std::chrono::milliseconds receive_timeout{50};
     std::chrono::milliseconds send_timeout{1000};
+    std::stop_token stop_token{};
 };
 
 // The later tray loop owns and calls a session from one thread; no hidden worker exists.

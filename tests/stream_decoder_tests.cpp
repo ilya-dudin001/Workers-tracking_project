@@ -104,7 +104,7 @@ TEST(StreamDecoder, OversizedHeaderPoisonsDecoderBeforePayloadArrives) {
 }
 
 TEST(StreamDecoder, BuffersAtMostOneIncompleteMaximumPacket) {
-    constexpr std::size_t frame_metadata_size = 20;
+    constexpr std::size_t frame_metadata_size = 28;
     const std::size_t image_size =
         monitor::protocol::kMaxPacketSize - monitor::protocol::kHeaderSize -
         frame_metadata_size;
