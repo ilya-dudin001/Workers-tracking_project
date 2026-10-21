@@ -99,6 +99,13 @@ public:
     }
 
     CaptureResult capture(const std::chrono::milliseconds timeout) {
+        if (!duplication_) {
+            try {
+                initialize();
+            } catch (const std::runtime_error&) {
+                return {CaptureStatus::AccessLost, std::nullopt};
+            }
+        }
         try {
             const auto current_monitor = primary_monitor_info();
             if (!equal_rect(current_monitor.rcMonitor, output_rect_)) {
@@ -127,6 +134,9 @@ public:
 
         // Desktop Duplication requires exactly one ReleaseFrame after every successful acquire.
         const AcquiredFrame release_frame(duplication_.Get());
+        if (!has_desktop_image_update(frame_info.LastPresentTime.QuadPart)) {
+            return {CaptureStatus::Timeout, std::nullopt};
+        }
         ComPtr<ID3D11Texture2D> desktop_texture;
         if (FAILED(desktop_resource.As(&desktop_texture))) {
             return {CaptureStatus::Fatal, std::nullopt};
@@ -139,8 +149,11 @@ public:
             description.Width > std::numeric_limits<std::uint32_t>::max() / 4U) {
             return {CaptureStatus::Fatal, std::nullopt};
         }
-        if (!staging_ || staging_width_ != description.Width ||
-            staging_height_ != description.Height) {
+        if (!staging_ ||
+            requires_staging_recreation(staging_width_,
+                                        staging_height_,
+                                        description.Width,
+                                        description.Height)) {
             D3D11_TEXTURE2D_DESC staging_description = description;
             staging_description.Usage = D3D11_USAGE_STAGING;
             staging_description.BindFlags = 0;

@@ -20,4 +20,16 @@ void copy_bgra_rows(const std::uint8_t* const source,
     }
 }
 
+bool has_desktop_image_update(const std::int64_t last_present_time) noexcept {
+    // Desktop Duplication may acquire a frame for pointer movement only.
+    return last_present_time != 0;
+}
+
+bool requires_staging_recreation(const std::uint32_t current_width,
+                                 const std::uint32_t current_height,
+                                 const std::uint32_t frame_width,
+                                 const std::uint32_t frame_height) noexcept {
+    return current_width != frame_width || current_height != frame_height;
+}
+
 }

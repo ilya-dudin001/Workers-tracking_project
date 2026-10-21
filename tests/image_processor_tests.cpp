@@ -16,6 +16,8 @@ namespace {
 using Microsoft::WRL::ComPtr;
 using monitor::worker_agent::BgraFrame;
 using monitor::worker_agent::EncodedImage;
+using monitor::worker_agent::kMaximumJpegQuality;
+using monitor::worker_agent::kMinimumJpegQuality;
 using monitor::worker_agent::WicImageProcessor;
 
 class TestComApartment {
@@ -106,13 +108,18 @@ TEST(WicImageProcessor, ScalesToFitPreservesAspectAndProducesDecodableJpeg) {
 
 TEST(WicImageProcessor, NeverUpscalesAndClampsQualityToDocumentedRange) {
     WicImageProcessor processor;
-    const auto low = processor.encode_jpeg(synthetic_frame(100, 50), 480, 270, 0);
-    const auto high = processor.encode_jpeg(synthetic_frame(100, 50), 480, 270, 500);
+    const auto frame = synthetic_frame(100, 50);
+    const auto low = processor.encode_jpeg(frame, 480, 270, 0);
+    const auto minimum = processor.encode_jpeg(frame, 480, 270, kMinimumJpegQuality);
+    const auto high = processor.encode_jpeg(frame, 480, 270, 500);
+    const auto maximum = processor.encode_jpeg(frame, 480, 270, kMaximumJpegQuality);
 
     EXPECT_EQ(low.width, 100U);
     EXPECT_EQ(low.height, 50U);
     EXPECT_EQ(decoded_dimensions(low.jpeg), std::make_pair(100U, 50U));
     EXPECT_EQ(decoded_dimensions(high.jpeg), std::make_pair(100U, 50U));
+    EXPECT_EQ(low.jpeg, minimum.jpeg);
+    EXPECT_EQ(high.jpeg, maximum.jpeg);
 }
 
 TEST(WicImageProcessor, RejectsInvalidFramesAndZeroBounds) {

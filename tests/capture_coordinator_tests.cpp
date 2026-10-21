@@ -6,8 +6,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <limits>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -129,6 +131,28 @@ TEST(CaptureCoordinator, DoesNotRetryUnavailableBackendsBeforeDelay) {
 
     EXPECT_EQ(coordinator.capture(2s, 10ms).status, CaptureStatus::Frame);
     EXPECT_EQ(factory.dxgi_attempts, 2U);
+}
+
+TEST(CaptureCoordinator, RejectsNonPositiveRetryDelay) {
+    FakeFactory factory;
+
+    EXPECT_THROW(static_cast<void>(CaptureCoordinator(factory, std::chrono::milliseconds(0))),
+                 std::invalid_argument);
+    EXPECT_THROW(static_cast<void>(CaptureCoordinator(factory, std::chrono::milliseconds(-1))),
+                 std::invalid_argument);
+}
+
+TEST(CaptureCoordinator, SaturatesRetryDeadlineAtMaximumTimestamp) {
+    using namespace std::chrono_literals;
+    FakeFactory factory;
+    factory.dxgi.push_back(nullptr);
+    factory.gdi.push_back(nullptr);
+    CaptureCoordinator coordinator(factory, 2s);
+    const auto maximum = std::chrono::milliseconds::max();
+
+    EXPECT_EQ(coordinator.capture(maximum - 1s, 10ms).status, CaptureStatus::Unavailable);
+    EXPECT_EQ(coordinator.capture(maximum, 10ms).status, CaptureStatus::Unavailable);
+    EXPECT_EQ(factory.dxgi_attempts, 1U);
 }
 
 TEST(CaptureCoordinator, PropagatesTimeoutWithoutRecreatingHealthyDxgi) {
