@@ -24,8 +24,40 @@ target_sources(worker_common
 target_include_directories(worker_common PUBLIC src)
 enable_strict_warnings(worker_common)
 
+add_library(worker_capture)
+target_sources(worker_capture
+    PUBLIC
+        FILE_SET HEADERS
+        BASE_DIRS src
+        FILES
+            src/worker_agent/capture_pixel_copy.h
+            src/worker_agent/capture_coordinator.h
+            src/worker_agent/capture_profiles.h
+            src/worker_agent/change_detector.h
+            src/worker_agent/dxgi_screen_capture.h
+            src/worker_agent/frame.h
+            src/worker_agent/gdi_screen_capture.h
+            src/worker_agent/image_processor.h
+            src/worker_agent/latest_frame_queue.h
+            src/worker_agent/screen_capture.h
+            src/worker_agent/windows_capture_factory.h
+    PRIVATE
+        src/worker_agent/capture_pixel_copy.cpp
+        src/worker_agent/capture_coordinator.cpp
+        src/worker_agent/capture_profiles.cpp
+        src/worker_agent/change_detector.cpp
+        src/worker_agent/dxgi_screen_capture.cpp
+        src/worker_agent/frame.cpp
+        src/worker_agent/gdi_screen_capture.cpp
+        src/worker_agent/image_processor.cpp
+        src/worker_agent/windows_capture_factory.cpp
+)
+target_include_directories(worker_capture PUBLIC src)
+target_link_libraries(worker_capture PRIVATE d3d11 dxgi windowscodecs gdi32 ole32)
+enable_strict_warnings(worker_capture)
+
 add_executable(WorkerAgent WIN32 src/worker_agent/main.cpp)
-target_link_libraries(WorkerAgent PRIVATE worker_common)
+target_link_libraries(WorkerAgent PRIVATE worker_common worker_capture)
 enable_strict_warnings(WorkerAgent)
 
 add_executable(Observer WIN32 src/observer/main.cpp)
@@ -44,12 +76,16 @@ if(BUILD_TESTING)
     FetchContent_MakeAvailable(googletest)
 
     add_executable(common_tests
+        tests/capture_coordinator_tests.cpp
+        tests/capture_core_tests.cpp
+        tests/image_processor_tests.cpp
         tests/protocol_tests.cpp
         tests/stream_decoder_tests.cpp
+        tests/windows_capture_tests.cpp
     )
-    target_link_libraries(common_tests PRIVATE worker_common GTest::gtest_main)
+    target_link_libraries(common_tests PRIVATE worker_common worker_capture GTest::gtest_main)
     enable_strict_warnings(common_tests)
 
     include(GoogleTest)
-    gtest_discover_tests(common_tests)
+    gtest_discover_tests(common_tests DISCOVERY_TIMEOUT 30)
 endif()
