@@ -68,7 +68,7 @@ std::vector<protocol::SetProfile> WinsockAgentSession::receive_commands() {
         return commands;
     } catch (const protocol::ProtocolError& error) {
         fail(error.what());
-        throw;
+        return {};
     } catch (const std::exception& error) {
         fail(error.what());
         return {};

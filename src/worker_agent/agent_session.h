@@ -31,6 +31,7 @@ struct AgentSessionConfig {
 };
 
 // The later tray loop owns and calls a session from one thread; no hidden worker exists.
+// Operational socket/protocol failures disconnect, set last_error, and do not escape.
 class AgentTransport {
 public:
     virtual ~AgentTransport() = default;
