@@ -2,6 +2,7 @@
 
 #include "common/protocol.h"
 
+#include <mutex>
 #include <optional>
 
 namespace monitor::observer {
@@ -25,6 +26,7 @@ public:
 
 private:
     ProfileSink& sink_;
+    mutable std::mutex mutex_;
     std::optional<protocol::AgentGuid> selection_;
 };
 

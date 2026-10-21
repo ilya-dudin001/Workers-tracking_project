@@ -11,29 +11,45 @@ protocol::SetProfile FocusRouter::focus_profile() noexcept {
 }
 
 void FocusRouter::agent_registered(const protocol::AgentGuid& guid) {
+    bool focused = false;
+    {
+        std::scoped_lock lock(mutex_);
+        focused = selection_ && *selection_ == guid;
+    }
     static_cast<void>(sink_.send_profile(
-        guid, selection_ && *selection_ == guid ? focus_profile() : grid_profile()));
+        guid, focused ? focus_profile() : grid_profile()));
 }
 
 void FocusRouter::select(const protocol::AgentGuid& guid) {
-    if (selection_ && *selection_ == guid) {
-        return;
+    std::optional<protocol::AgentGuid> previous;
+    {
+        std::scoped_lock lock(mutex_);
+        if (selection_ && *selection_ == guid) {
+            return;
+        }
+        previous = selection_;
+        selection_ = guid;
     }
-    if (selection_) {
-        static_cast<void>(sink_.send_profile(*selection_, grid_profile()));
+    if (previous) {
+        static_cast<void>(sink_.send_profile(*previous, grid_profile()));
     }
-    selection_ = guid;
     static_cast<void>(sink_.send_profile(guid, focus_profile()));
 }
 
 void FocusRouter::clear() {
-    if (selection_) {
-        static_cast<void>(sink_.send_profile(*selection_, grid_profile()));
+    std::optional<protocol::AgentGuid> previous;
+    {
+        std::scoped_lock lock(mutex_);
+        previous = selection_;
+        selection_.reset();
     }
-    selection_.reset();
+    if (previous) {
+        static_cast<void>(sink_.send_profile(*previous, grid_profile()));
+    }
 }
 
 std::optional<protocol::AgentGuid> FocusRouter::selection() const {
+    std::scoped_lock lock(mutex_);
     return selection_;
 }
 

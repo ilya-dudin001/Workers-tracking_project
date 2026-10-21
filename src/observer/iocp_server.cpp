@@ -37,6 +37,7 @@ std::string socket_error(const char* operation) {
 
 class IocpServer::Impl {
 public:
+    enum class Lifecycle { Stopped, Starting, Running, Stopping };
     struct Connection;
     enum class OperationKind { Accept, Receive, Send };
     struct Operation {
@@ -61,7 +62,8 @@ public:
         std::deque<protocol::Bytes> control_queue;
         bool send_active = false;
         std::atomic<bool> closed{false};
-        AgentRegistry::Clock::time_point hello_deadline;
+        const AgentRegistry::Clock::time_point hello_deadline;
+        // Identity fields are read and written only while state_mutex_ is held.
         std::optional<protocol::AgentGuid> guid;
         std::uint64_t generation = 0;
 
@@ -79,8 +81,11 @@ public:
     }
 
     bool start() {
-        if (running_.exchange(true)) {
-            return true;
+        {
+            std::scoped_lock lock(state_mutex_);
+            if (lifecycle_ == Lifecycle::Running) return true;
+            if (lifecycle_ != Lifecycle::Stopped) return false;
+            lifecycle_ = Lifecycle::Starting;
         }
         iocp_ = CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, 0);
         if (iocp_ == nullptr) {
@@ -136,7 +141,17 @@ public:
                 post_accept();
             }
             monitor_thread_ = std::thread([this] { monitor_loop(); });
+            {
+                std::scoped_lock lock(state_mutex_);
+                lifecycle_ = Lifecycle::Running;
+            }
+            lifecycle_cv_.notify_all();
         } catch (...) {
+            {
+                std::scoped_lock lock(state_mutex_);
+                lifecycle_ = Lifecycle::Running;
+            }
+            lifecycle_cv_.notify_all();
             stop();
             throw;
         }
@@ -144,24 +159,33 @@ public:
     }
 
     void stop() noexcept {
-        if (!running_.exchange(false)) {
-            cleanup_handles();
-            return;
-        }
-        if (listener_ != INVALID_SOCKET) {
-            closesocket(listener_);
-            listener_ = INVALID_SOCKET;
-        }
-        if (monitor_thread_.joinable()) {
-            monitor_thread_.join();
-        }
+        SOCKET listener = INVALID_SOCKET;
         std::vector<std::shared_ptr<Connection>> connections;
         {
-            std::scoped_lock lock(connections_mutex_);
+            std::unique_lock lock(state_mutex_);
+            lifecycle_cv_.wait(lock, [this] {
+                return lifecycle_ != Lifecycle::Starting;
+            });
+            if (lifecycle_ == Lifecycle::Stopped) return;
+            if (lifecycle_ == Lifecycle::Stopping) {
+                lifecycle_cv_.wait(lock, [this] {
+                    return lifecycle_ == Lifecycle::Stopped;
+                });
+                return;
+            }
+            lifecycle_ = Lifecycle::Stopping;
+            listener = std::exchange(listener_, INVALID_SOCKET);
+            connections.reserve(connections_.size());
             for (const auto& [socket, connection] : connections_) {
                 static_cast<void>(socket);
                 connections.push_back(connection);
             }
+        }
+        if (listener != INVALID_SOCKET) {
+            closesocket(listener);
+        }
+        if (monitor_thread_.joinable()) {
+            monitor_thread_.join();
         }
         for (const auto& connection : connections) {
             close_connection(connection);
@@ -182,19 +206,28 @@ public:
             }
         }
         workers_.clear();
-        cleanup_handles();
+        if (iocp_ != nullptr) {
+            CloseHandle(iocp_);
+            iocp_ = nullptr;
+        }
+        {
+            std::scoped_lock lock(state_mutex_);
+            lifecycle_ = Lifecycle::Stopped;
+        }
+        lifecycle_cv_.notify_all();
     }
 
     bool send_profile(const protocol::AgentGuid& guid,
                       const protocol::SetProfile& profile) {
         std::shared_ptr<Connection> connection;
         {
-            std::scoped_lock lock(connections_mutex_);
+            std::scoped_lock lock(state_mutex_);
+            if (lifecycle_ != Lifecycle::Running) return false;
             const auto found = by_guid_.find(guid);
             if (found == by_guid_.end()) {
                 return false;
             }
-            connection = found->second.lock();
+            connection = found->second;
         }
         if (!connection || connection->closed) {
             return false;
@@ -233,48 +266,75 @@ public:
         return last_error_;
     }
 
+    std::size_t connection_count() const {
+        std::scoped_lock lock(state_mutex_);
+        return connections_.size();
+    }
+
+    void set_registration_handler(
+        std::function<void(const protocol::AgentGuid&)> handler) {
+        std::scoped_lock lock(state_mutex_);
+        registration_handler_ = std::move(handler);
+    }
+
 private:
     bool fail(std::string message) {
         {
             std::scoped_lock lock(error_mutex_);
             last_error_ = std::move(message);
         }
-        running_ = false;
-        cleanup_handles();
-        return false;
-    }
-
-    void cleanup_handles() noexcept {
-        if (listener_ != INVALID_SOCKET) {
-            closesocket(listener_);
-            listener_ = INVALID_SOCKET;
+        SOCKET listener = INVALID_SOCKET;
+        {
+            std::scoped_lock lock(state_mutex_);
+            lifecycle_ = Lifecycle::Stopped;
+            listener = std::exchange(listener_, INVALID_SOCKET);
         }
+        lifecycle_cv_.notify_all();
+        if (listener != INVALID_SOCKET) closesocket(listener);
         if (iocp_ != nullptr) {
             CloseHandle(iocp_);
             iocp_ = nullptr;
         }
+        return false;
     }
 
     void monitor_loop() {
-        while (running_) {
+        for (;;) {
+            {
+                std::unique_lock lock(state_mutex_);
+                lifecycle_cv_.wait(lock, [this] {
+                    return lifecycle_ != Lifecycle::Starting;
+                });
+                if (lifecycle_ != Lifecycle::Running) return;
+            }
             expire_hello_deadlines();
             std::this_thread::sleep_for(std::chrono::milliseconds(25));
         }
     }
 
     void post_accept() {
-        if (!running_) return;
         auto operation = std::make_unique<Operation>(
             OperationKind::Accept, std::shared_ptr<Connection>{});
         operation->accepted_socket = WSASocketW(
             AF_INET, SOCK_STREAM, IPPROTO_TCP, nullptr, 0, WSA_FLAG_OVERLAPPED);
         if (operation->accepted_socket == INVALID_SOCKET) return;
         DWORD received = 0;
-        add_operation();
-        const BOOL result = accept_ex_(
-            listener_, operation->accepted_socket, operation->accept_buffer.data(),
-            0, sizeof(sockaddr_in) + 16U, sizeof(sockaddr_in) + 16U,
-            &received, &operation->overlapped);
+        BOOL result = FALSE;
+        {
+            std::scoped_lock lock(state_mutex_);
+            if ((lifecycle_ != Lifecycle::Running &&
+                 lifecycle_ != Lifecycle::Starting) ||
+                listener_ == INVALID_SOCKET) {
+                closesocket(operation->accepted_socket);
+                return;
+            }
+            add_operation();
+            result = accept_ex_(
+                listener_, operation->accepted_socket,
+                operation->accept_buffer.data(), 0,
+                sizeof(sockaddr_in) + 16U, sizeof(sockaddr_in) + 16U,
+                &received, &operation->overlapped);
+        }
         if (!result && WSAGetLastError() != ERROR_IO_PENDING) {
             finish_operation();
             closesocket(operation->accepted_socket);
@@ -284,15 +344,30 @@ private:
     }
 
     void accept_connection(const SOCKET socket) {
-        if (CreateIoCompletionPort(reinterpret_cast<HANDLE>(socket), iocp_, 0, 0)
-            == nullptr) {
-            closesocket(socket);
-            return;
-        }
-        const auto connection = std::make_shared<Connection>(*this, socket);
+        std::shared_ptr<Connection> connection;
         {
-            std::scoped_lock lock(connections_mutex_);
-            connections_.emplace(socket, connection);
+            std::scoped_lock lock(state_mutex_);
+            if (lifecycle_ != Lifecycle::Running ||
+                listener_ == INVALID_SOCKET) {
+                closesocket(socket);
+                return;
+            }
+            if (setsockopt(socket, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT,
+                           reinterpret_cast<const char*>(&listener_),
+                           sizeof(listener_)) == SOCKET_ERROR ||
+                CreateIoCompletionPort(reinterpret_cast<HANDLE>(socket),
+                                       iocp_, 0, 0) == nullptr) {
+                closesocket(socket);
+                return;
+            }
+            connection = std::make_shared<Connection>(*this, socket);
+            const auto [iterator, inserted] =
+                connections_.emplace(socket, connection);
+            static_cast<void>(iterator);
+            if (!inserted) {
+                closesocket(socket);
+                return;
+            }
         }
         post_receive(connection);
     }
@@ -301,10 +376,10 @@ private:
         std::vector<std::shared_ptr<Connection>> expired;
         const auto now = AgentRegistry::Clock::now();
         {
-            std::scoped_lock lock(connections_mutex_);
+            std::scoped_lock lock(state_mutex_);
             for (const auto& [socket, connection] : connections_) {
                 static_cast<void>(socket);
-                if (!connection->guid && now >= connection->hello_deadline) {
+                if (!connection->guid && now > connection->hello_deadline) {
                     expired.push_back(connection);
                 }
             }
@@ -327,9 +402,6 @@ private:
     }
 
     void post_receive(const std::shared_ptr<Connection>& connection) {
-        if (!running_ || connection->closed) {
-            return;
-        }
         auto operation = std::make_unique<Operation>(
             OperationKind::Receive, connection);
         WSABUF buffer{
@@ -337,9 +409,16 @@ private:
             reinterpret_cast<char*>(operation->receive_buffer.data())};
         DWORD flags = 0;
         DWORD received = 0;
-        add_operation();
-        const int result = WSARecv(connection->socket, &buffer, 1, &received,
-                                   &flags, &operation->overlapped, nullptr);
+        int result = SOCKET_ERROR;
+        {
+            std::scoped_lock lock(state_mutex_);
+            if (lifecycle_ != Lifecycle::Running || connection->closed) {
+                return;
+            }
+            add_operation();
+            result = WSARecv(connection->socket, &buffer, 1, &received,
+                             &flags, &operation->overlapped, nullptr);
+        }
         if (result == SOCKET_ERROR && WSAGetLastError() != WSA_IO_PENDING) {
             finish_operation();
             close_connection(connection);
@@ -370,9 +449,17 @@ private:
             reinterpret_cast<char*>(operation->send_buffer.data() +
                                     operation->send_offset)};
         DWORD sent = 0;
-        add_operation();
-        const int result = WSASend(operation->connection->socket, &buffer, 1,
-                                   &sent, 0, &operation->overlapped, nullptr);
+        int result = SOCKET_ERROR;
+        {
+            std::scoped_lock lock(state_mutex_);
+            if (lifecycle_ != Lifecycle::Running ||
+                operation->connection->closed) {
+                return;
+            }
+            add_operation();
+            result = WSASend(operation->connection->socket, &buffer, 1,
+                             &sent, 0, &operation->overlapped, nullptr);
+        }
         if (result == SOCKET_ERROR && WSAGetLastError() != WSA_IO_PENDING) {
             finish_operation();
             close_connection(operation->connection);
@@ -394,25 +481,22 @@ private:
             }
             std::unique_ptr<Operation> operation(
                 CONTAINING_RECORD(raw, Operation, overlapped));
-            finish_operation();
             if (operation->kind == OperationKind::Accept) {
                 const SOCKET accepted = operation->accepted_socket;
                 operation->accepted_socket = INVALID_SOCKET;
-                if (succeeded && running_) {
-                    static_cast<void>(setsockopt(
-                        accepted, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT,
-                        reinterpret_cast<const char*>(&listener_),
-                        sizeof(listener_)));
+                if (succeeded) {
                     accept_connection(accepted);
                 } else {
                     closesocket(accepted);
                 }
-                if (running_) post_accept();
+                post_accept();
+                finish_operation();
                 continue;
             }
             const auto connection = operation->connection;
             if (!succeeded || bytes == 0 || connection->closed) {
                 close_connection(connection);
+                finish_operation();
                 continue;
             }
             if (operation->kind == OperationKind::Receive) {
@@ -421,6 +505,7 @@ private:
                 if (!connection->closed) {
                     post_receive(connection);
                 }
+                finish_operation();
             } else {
                 operation->send_offset += bytes;
                 if (operation->send_offset < operation->send_buffer.size()) {
@@ -429,8 +514,18 @@ private:
                 } else {
                     post_next_send(connection);
                 }
+                finish_operation();
             }
         }
+    }
+
+    std::optional<std::pair<protocol::AgentGuid, std::uint64_t>>
+    connection_identity(const std::shared_ptr<Connection>& connection) const {
+        std::scoped_lock lock(state_mutex_);
+        if (!connection->guid || connection->closed) {
+            return std::nullopt;
+        }
+        return std::make_pair(*connection->guid, connection->generation);
     }
 
     void handle_receive(const std::shared_ptr<Connection>& connection,
@@ -438,7 +533,8 @@ private:
         try {
             const auto messages = connection->decoder.feed(bytes);
             for (const auto& message : messages) {
-                if (!connection->guid) {
+                const auto identity = connection_identity(connection);
+                if (!identity) {
                     const auto* hello = std::get_if<protocol::Hello>(&message);
                     if (hello == nullptr || !handle_hello(connection, *hello)) {
                         close_connection(connection);
@@ -454,11 +550,11 @@ private:
                         return;
                     }
                     static_cast<void>(registry_.update_frame(
-                        *connection->guid, connection->generation, *frame,
+                        identity->first, identity->second, *frame,
                         AgentRegistry::Clock::now()));
                 } else if (std::holds_alternative<protocol::Heartbeat>(message)) {
                     static_cast<void>(registry_.heartbeat(
-                        *connection->guid, connection->generation,
+                        identity->first, identity->second,
                         AgentRegistry::Clock::now()));
                 } else {
                     close_connection(connection);
@@ -472,28 +568,38 @@ private:
 
     bool handle_hello(const std::shared_ptr<Connection>& connection,
                       const protocol::Hello& hello) {
-        const auto generation = registry_.register_agent(
-            hello.agent_guid, hello.employee_name, hello.hostname,
-            AgentRegistry::Clock::now());
-        if (!generation) {
-            return false;
-        }
-        connection->guid = hello.agent_guid;
-        connection->generation = *generation;
         std::shared_ptr<Connection> replaced;
+        std::function<void(const protocol::AgentGuid&)> handler;
         {
-            std::scoped_lock lock(connections_mutex_);
+            std::scoped_lock lock(state_mutex_);
+            const auto now = AgentRegistry::Clock::now();
+            if (lifecycle_ != Lifecycle::Running || connection->closed ||
+                connection->guid || now > connection->hello_deadline) {
+                return false;
+            }
+            const auto generation = registry_.register_agent(
+                hello.agent_guid, hello.employee_name, hello.hostname, now);
+            if (!generation) {
+                return false;
+            }
+            connection->guid = hello.agent_guid;
+            connection->generation = *generation;
             const auto found = by_guid_.find(hello.agent_guid);
             if (found != by_guid_.end()) {
-                replaced = found->second.lock();
+                replaced = found->second;
             }
             by_guid_[hello.agent_guid] = connection;
+            handler = registration_handler_;
         }
         if (replaced && replaced != connection) {
             close_connection(replaced);
         }
-        static_cast<void>(send_profile(hello.agent_guid,
-                                       FocusRouter::grid_profile()));
+        if (handler) {
+            handler(hello.agent_guid);
+        } else {
+            static_cast<void>(send_profile(hello.agent_guid,
+                                           FocusRouter::grid_profile()));
+        }
         return true;
     }
 
@@ -501,28 +607,38 @@ private:
         if (connection->closed.exchange(true)) {
             return;
         }
+        std::optional<std::pair<protocol::AgentGuid, std::uint64_t>> identity;
+        {
+            std::scoped_lock lock(state_mutex_);
+            if (connection->guid) {
+                identity = std::make_pair(*connection->guid,
+                                          connection->generation);
+                const auto found = by_guid_.find(*connection->guid);
+                if (found != by_guid_.end() &&
+                    found->second == connection) {
+                    by_guid_.erase(found);
+                }
+            }
+            const auto found = connections_.find(connection->socket);
+            if (found != connections_.end() && found->second == connection) {
+                connections_.erase(found);
+            }
+        }
         static_cast<void>(shutdown(connection->socket, SD_BOTH));
         static_cast<void>(CancelIoEx(
             reinterpret_cast<HANDLE>(connection->socket), nullptr));
         closesocket(connection->socket);
-        if (connection->guid) {
-            registry_.disconnect(*connection->guid, connection->generation,
+        if (identity) {
+            registry_.disconnect(identity->first, identity->second,
                                  AgentRegistry::Clock::now());
-        }
-        std::scoped_lock lock(connections_mutex_);
-        connections_.erase(connection->socket);
-        if (connection->guid) {
-            const auto found = by_guid_.find(*connection->guid);
-            if (found != by_guid_.end() &&
-                found->second.lock() == connection) {
-                by_guid_.erase(found);
-            }
         }
     }
 
     AgentRegistry& registry_;
     Config config_;
-    std::atomic<bool> running_{false};
+    mutable std::mutex state_mutex_;
+    std::condition_variable lifecycle_cv_;
+    Lifecycle lifecycle_ = Lifecycle::Stopped;
     SOCKET listener_ = INVALID_SOCKET;
     HANDLE iocp_ = nullptr;
     std::uint16_t port_ = 0;
@@ -531,9 +647,9 @@ private:
     std::vector<std::thread> workers_;
     mutable std::mutex error_mutex_;
     std::string last_error_;
-    std::mutex connections_mutex_;
     std::unordered_map<SOCKET, std::shared_ptr<Connection>> connections_;
-    std::map<protocol::AgentGuid, std::weak_ptr<Connection>> by_guid_;
+    std::map<protocol::AgentGuid, std::shared_ptr<Connection>> by_guid_;
+    std::function<void(const protocol::AgentGuid&)> registration_handler_;
     std::mutex operation_mutex_;
     std::condition_variable operation_cv_;
     std::size_t active_operations_ = 0;
@@ -558,6 +674,15 @@ std::uint16_t IocpServer::port() const noexcept {
 
 std::string IocpServer::last_error() const {
     return impl_->last_error();
+}
+
+std::size_t IocpServer::connection_count() const {
+    return impl_->connection_count();
+}
+
+void IocpServer::set_registration_handler(
+    std::function<void(const protocol::AgentGuid&)> handler) {
+    impl_->set_registration_handler(std::move(handler));
 }
 
 bool IocpServer::send_profile(const protocol::AgentGuid& guid,

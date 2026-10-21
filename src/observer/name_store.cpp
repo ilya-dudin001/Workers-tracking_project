@@ -3,15 +3,17 @@
 #include <windows.h>
 
 #include <array>
+#include <atomic>
 #include <cstdlib>
 #include <fstream>
-#include <iterator>
+#include <limits>
 #include <system_error>
 
 namespace monitor::observer {
 namespace {
 
 constexpr std::size_t kMaxNameBytes = 255;
+std::atomic<std::uint64_t> temporary_counter{0};
 
 bool valid_utf8(const std::string& value) {
     if (value.empty() || value.size() > kMaxNameBytes) {
@@ -80,16 +82,46 @@ bool NameStore::save(const protocol::AgentGuid& guid,
         return false;
     }
     const auto target = directory_ / (to_hex(guid) + ".name");
-    const auto temporary = target.wstring() + L".tmp";
-    {
-        std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
-        output.write(utf8_name.data(), static_cast<std::streamsize>(utf8_name.size()));
-        if (!output) {
+    std::filesystem::path temporary;
+    HANDLE file = INVALID_HANDLE_VALUE;
+    for (int attempt = 0; attempt < 16 && file == INVALID_HANDLE_VALUE; ++attempt) {
+        const auto suffix = std::to_wstring(GetCurrentProcessId()) + L"." +
+            std::to_wstring(temporary_counter.fetch_add(1)) + L".tmp";
+        temporary = directory_ / (target.filename().wstring() + L"." + suffix);
+        file = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr,
+                           CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file == INVALID_HANDLE_VALUE &&
+            GetLastError() != ERROR_FILE_EXISTS) {
             return false;
         }
     }
-    if (!MoveFileExW(temporary.c_str(), target.c_str(),
-                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+    if (file == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    DWORD written = 0;
+    const bool write_succeeded =
+        WriteFile(file, utf8_name.data(), static_cast<DWORD>(utf8_name.size()),
+                  &written, nullptr) != FALSE &&
+        written == static_cast<DWORD>(utf8_name.size()) &&
+        FlushFileBuffers(file) != FALSE;
+    const bool close_succeeded = CloseHandle(file) != FALSE;
+    if (!write_succeeded || !close_succeeded) {
+        std::filesystem::remove(temporary, error);
+        return false;
+    }
+    bool replaced = false;
+    if (std::filesystem::exists(target, error) && !error) {
+        replaced = ReplaceFileW(target.c_str(), temporary.c_str(), nullptr,
+                                REPLACEFILE_WRITE_THROUGH, nullptr, nullptr) != FALSE;
+    } else if (!error) {
+        replaced = MoveFileExW(temporary.c_str(), target.c_str(),
+                               MOVEFILE_WRITE_THROUGH) != FALSE;
+        if (!replaced && GetLastError() == ERROR_ALREADY_EXISTS) {
+            replaced = ReplaceFileW(target.c_str(), temporary.c_str(), nullptr,
+                                    REPLACEFILE_WRITE_THROUGH, nullptr, nullptr) != FALSE;
+        }
+    }
+    if (!replaced) {
         std::filesystem::remove(temporary, error);
         return false;
     }
@@ -104,19 +136,40 @@ std::map<protocol::AgentGuid, std::string> NameStore::load() const {
     }
     for (std::filesystem::directory_iterator iterator(directory_, error), end;
          !error && iterator != end; iterator.increment(error)) {
-        if (!iterator->is_regular_file(error) || iterator->path().extension() != ".name") {
+        try {
+            std::error_code file_error;
+            if (!iterator->is_regular_file(file_error) || file_error ||
+                iterator->path().extension() != ".name") {
+                continue;
+            }
+            const auto size = iterator->file_size(file_error);
+            if (file_error || size == 0U || size > kMaxNameBytes) {
+                continue;
+            }
+            protocol::AgentGuid guid{};
+            const std::string stem = iterator->path().stem().string();
+            if (!from_hex(stem, guid)) {
+                continue;
+            }
+            std::ifstream input(iterator->path(), std::ios::binary);
+            if (!input) {
+                continue;
+            }
+            std::array<char, kMaxNameBytes + 1U> bytes{};
+            input.read(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+            const std::streamsize read = input.gcount();
+            if (read <= 0 ||
+                read > static_cast<std::streamsize>(kMaxNameBytes)) {
+                continue;
+            }
+            std::string value(bytes.data(), static_cast<std::size_t>(read));
+            if (valid_utf8(value)) {
+                result.emplace(guid, std::move(value));
+            }
+        } catch (const std::filesystem::filesystem_error&) {
             continue;
-        }
-        protocol::AgentGuid guid{};
-        const std::string stem = iterator->path().stem().string();
-        if (!from_hex(stem, guid)) {
+        } catch (const std::ios_base::failure&) {
             continue;
-        }
-        std::ifstream input(iterator->path(), std::ios::binary);
-        std::string value{std::istreambuf_iterator<char>(input),
-                          std::istreambuf_iterator<char>()};
-        if (valid_utf8(value)) {
-            result.emplace(guid, std::move(value));
         }
     }
     return result;

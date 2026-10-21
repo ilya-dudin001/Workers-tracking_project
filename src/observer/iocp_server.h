@@ -5,6 +5,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 
@@ -28,6 +29,9 @@ public:
     void stop() noexcept;
     [[nodiscard]] std::uint16_t port() const noexcept;
     [[nodiscard]] std::string last_error() const;
+    [[nodiscard]] std::size_t connection_count() const;
+    void set_registration_handler(
+        std::function<void(const protocol::AgentGuid&)> handler);
     bool send_profile(const protocol::AgentGuid& guid,
                       const protocol::SetProfile& profile) override;
 

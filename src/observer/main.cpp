@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <exception>
+#include <memory>
 #include <string>
 
 namespace {
@@ -71,6 +72,14 @@ int WINAPI wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE,
             registry.set_local_name(guid, name);
         }
         monitor::observer::IocpServer server(registry, parse_config());
+        auto router = std::make_shared<monitor::observer::FocusRouter>(server);
+        const std::weak_ptr<monitor::observer::FocusRouter> weak_router = router;
+        server.set_registration_handler(
+            [weak_router](const monitor::protocol::AgentGuid& guid) {
+                if (const auto current = weak_router.lock()) {
+                    current->agent_registered(guid);
+                }
+            });
         if (!server.start()) {
             const std::string error = server.last_error();
             const std::wstring message =
@@ -81,7 +90,7 @@ int WINAPI wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE,
             return 1;
         }
         monitor::observer::ObserverWindow window(
-            instance, registry, server, names);
+            instance, registry, *router, names);
         const int result = window.run(show_command);
         server.stop();
         return result;

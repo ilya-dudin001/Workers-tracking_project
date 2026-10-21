@@ -1,8 +1,10 @@
 #include "observer/agent_registry.h"
+#include "observer/frame_cache.h"
 #include "observer/focus_router.h"
 #include "observer/jpeg_decoder.h"
 #include "observer/layout.h"
 #include "observer/name_store.h"
+#include "observer/render_state.h"
 
 #include <gtest/gtest.h>
 
@@ -11,6 +13,7 @@
 #include <fstream>
 #include <memory>
 #include <string>
+#include <system_error>
 #include <vector>
 
 namespace {
@@ -99,6 +102,16 @@ TEST(LayoutEngine, IsDeterministicNonOverlappingAndHitTestable) {
               LayoutEngine::compute(1, {0, 0, 200, 100})[0].bounds.right);
 }
 
+TEST(LayoutEngine, UsesDeviceIndependentCoordinatesAtCommonDpis) {
+    const auto at_96 = monitor::observer::DpiMetrics::from_dpi(96);
+    const auto at_144 = monitor::observer::DpiMetrics::from_dpi(144);
+    const auto at_192 = monitor::observer::DpiMetrics::from_dpi(192);
+    EXPECT_EQ(at_96.pixels_to_dips({0, 0, 1920, 1080}), (monitor::observer::Rect{0, 0, 1920, 1080}));
+    EXPECT_EQ(at_144.pixels_to_dips({0, 0, 2880, 1620}), (monitor::observer::Rect{0, 0, 1920, 1080}));
+    EXPECT_EQ(at_192.pixels_to_dips({0, 0, 3840, 2160}), (monitor::observer::Rect{0, 0, 1920, 1080}));
+    EXPECT_EQ(at_144.pixel_point_to_dips(150, 300), std::make_pair(100, 200));
+}
+
 class FakeProfileSink final : public monitor::observer::ProfileSink {
 public:
     bool send_profile(const AgentGuid& id, const SetProfile& profile) override {
@@ -132,15 +145,55 @@ TEST(NameStore, RoundTripsAtomicallyAndIgnoresCorruptOrOversizedRecords) {
     std::filesystem::remove_all(root);
     monitor::observer::NameStore store(root);
     EXPECT_TRUE(store.save(guid(3), "Renamed Worker"));
-    EXPECT_EQ(store.load()[guid(3)], "Renamed Worker");
+    EXPECT_TRUE(store.save(guid(3), "Replaced Name"));
+    EXPECT_EQ(store.load()[guid(3)], "Replaced Name");
     EXPECT_FALSE(store.save(guid(4), ""));
     EXPECT_FALSE(store.save(guid(4), std::string(300, 'x')));
 
     const auto corrupt = root / "ffffffffffffffffffffffffffffffff.name";
     std::ofstream(corrupt, std::ios::binary) << "\xff\xfe";
+    const auto huge = root / "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee.name";
+    {
+        std::ofstream output(huge, std::ios::binary);
+        const std::string block(1024U * 1024U, 'x');
+        output.write(block.data(), static_cast<std::streamsize>(block.size()));
+    }
+    const auto invalid_name = root / "not-a-guid.name";
+    std::ofstream(invalid_name, std::ios::binary) << "ignored";
     const auto loaded = store.load();
     EXPECT_FALSE(loaded.contains(guid(255)));
+    EXPECT_FALSE(loaded.contains(guid(238)));
     std::filesystem::remove_all(root);
+}
+
+TEST(FrameDecodeCache, CachesSuccessAndFailureUntilFrameIdentityChanges) {
+    monitor::observer::FrameDecodeCache cache;
+    const monitor::observer::FrameIdentity first{guid(1), 7, 10};
+    EXPECT_TRUE(cache.should_decode(first));
+    cache.record_attempt(first, false);
+    EXPECT_FALSE(cache.should_decode(first));
+    EXPECT_EQ(cache.outcome(first), monitor::observer::DecodeOutcome::Failed);
+    const monitor::observer::FrameIdentity next_sequence{guid(1), 7, 11};
+    EXPECT_TRUE(cache.should_decode(next_sequence));
+    cache.record_attempt(next_sequence, true);
+    EXPECT_FALSE(cache.should_decode(next_sequence));
+    const monitor::observer::FrameIdentity next_generation{guid(1), 8, 11};
+    EXPECT_TRUE(cache.should_decode(next_generation));
+}
+
+TEST(DeviceResourceState, DiscardsOnResizeOrEndDrawDeviceLoss) {
+    monitor::observer::DeviceResourceState state;
+    EXPECT_FALSE(state.ready());
+    state.creation_completed(true);
+    EXPECT_TRUE(state.ready());
+    EXPECT_FALSE(state.apply(monitor::observer::RenderResult::Ok));
+    EXPECT_TRUE(state.apply(monitor::observer::RenderResult::RecreateTarget));
+    EXPECT_FALSE(state.ready());
+    state.creation_completed(false);
+    EXPECT_FALSE(state.ready());
+    state.creation_completed(true);
+    EXPECT_TRUE(state.apply(monitor::observer::RenderResult::Failed));
+    EXPECT_FALSE(state.ready());
 }
 
 TEST(JpegDecoder, DecodesValidImageAndDropsMalformedOrOversizedMetadata) {

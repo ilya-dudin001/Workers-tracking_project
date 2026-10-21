@@ -16,7 +16,7 @@ namespace monitor::observer {
 class ObserverWindow {
 public:
     ObserverWindow(HINSTANCE instance, AgentRegistry& registry,
-                   ProfileSink& profile_sink, NameStore& names);
+                   FocusRouter& router, NameStore& names);
     ~ObserverWindow();
     ObserverWindow(const ObserverWindow&) = delete;
     ObserverWindow& operator=(const ObserverWindow&) = delete;

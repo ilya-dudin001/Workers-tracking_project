@@ -90,18 +90,22 @@ target_sources(observer_core
         BASE_DIRS src
         FILES
             src/observer/agent_registry.h
+            src/observer/frame_cache.h
             src/observer/focus_router.h
             src/observer/iocp_server.h
             src/observer/jpeg_decoder.h
             src/observer/layout.h
             src/observer/name_store.h
+            src/observer/render_state.h
     PRIVATE
         src/observer/agent_registry.cpp
+        src/observer/frame_cache.cpp
         src/observer/focus_router.cpp
         src/observer/iocp_server.cpp
         src/observer/jpeg_decoder.cpp
         src/observer/layout.cpp
         src/observer/name_store.cpp
+        src/observer/render_state.cpp
 )
 target_include_directories(observer_core PUBLIC src)
 target_link_libraries(observer_core PUBLIC worker_common PRIVATE windowscodecs ole32)

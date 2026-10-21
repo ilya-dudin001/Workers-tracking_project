@@ -6,8 +6,10 @@
 #include <windowsx.h>
 #include <wrl/client.h>
 
+#include "observer/frame_cache.h"
 #include "observer/jpeg_decoder.h"
 #include "observer/layout.h"
+#include "observer/render_state.h"
 
 #include <algorithm>
 #include <array>
@@ -85,18 +87,44 @@ public:
             L"Rename employee", WS_CAPTION | WS_SYSMENU | WS_POPUP,
             x, y, 380, 145, parent, nullptr, instance, &prompt);
         if (prompt.window_ == nullptr) return std::nullopt;
-        EnableWindow(parent, FALSE);
+        const bool parent_was_enabled = IsWindowEnabled(parent) != FALSE;
+        if (parent_was_enabled) EnableWindow(parent, FALSE);
+        struct OwnerRestore {
+            HWND parent;
+            bool restore;
+            ~OwnerRestore() {
+                if (restore && IsWindow(parent)) {
+                    EnableWindow(parent, TRUE);
+                    SetForegroundWindow(parent);
+                }
+            }
+        };
+        const OwnerRestore restore{parent, parent_was_enabled};
+        static_cast<void>(restore);
         ShowWindow(prompt.window_, SW_SHOW);
         MSG message{};
-        while (!prompt.done_ && GetMessageW(&message, nullptr, 0, 0) > 0) {
+        bool repost_quit = false;
+        int quit_code = 0;
+        bool message_error = false;
+        while (!prompt.done_) {
+            const BOOL result = GetMessageW(&message, nullptr, 0, 0);
+            if (result == -1) {
+                message_error = true;
+                break;
+            }
+            if (result == 0) {
+                repost_quit = true;
+                quit_code = static_cast<int>(message.wParam);
+                break;
+            }
             if (!IsDialogMessageW(prompt.window_, &message)) {
                 TranslateMessage(&message);
                 DispatchMessageW(&message);
             }
         }
-        EnableWindow(parent, TRUE);
-        SetForegroundWindow(parent);
-        return prompt.result_;
+        if (IsWindow(prompt.window_)) DestroyWindow(prompt.window_);
+        if (repost_quit) PostQuitMessage(quit_code);
+        return message_error ? std::nullopt : prompt.result_;
     }
 
 private:
@@ -156,6 +184,10 @@ private:
             case WM_DESTROY:
                 self->done_ = true;
                 return 0;
+            case WM_NCDESTROY:
+                SetWindowLongPtrW(window, GWLP_USERDATA, 0);
+                self->window_ = nullptr;
+                return DefWindowProcW(window, message, wparam, lparam);
             default:
                 break;
         }
@@ -177,13 +209,19 @@ D2D1_RECT_F to_d2d(const Rect& rect) {
                        static_cast<float>(rect.bottom));
 }
 
+RenderResult render_result(const HRESULT result) {
+    if (SUCCEEDED(result)) return RenderResult::Ok;
+    return result == D2DERR_RECREATE_TARGET
+        ? RenderResult::RecreateTarget : RenderResult::Failed;
+}
+
 }
 
 class ObserverWindow::Impl {
 public:
-    Impl(HINSTANCE instance, AgentRegistry& registry, ProfileSink& sink,
+    Impl(HINSTANCE instance, AgentRegistry& registry, FocusRouter& router,
          NameStore& names)
-        : instance_(instance), registry_(registry), router_(sink), names_(names) {}
+        : instance_(instance), registry_(registry), router_(router), names_(names) {}
 
     int run(const int show_command) {
         WNDCLASSEXW window_class{sizeof(window_class)};
@@ -216,8 +254,6 @@ public:
 
 private:
     struct CachedBitmap {
-        std::uint64_t generation = 0;
-        std::uint64_t sequence = 0;
         ComPtr<ID2D1Bitmap> bitmap;
     };
 
@@ -248,8 +284,11 @@ private:
                 return 0;
             case WM_SIZE:
                 if (target_) {
-                    static_cast<void>(target_->Resize(
-                        D2D1::SizeU(LOWORD(lparam), HIWORD(lparam))));
+                    const HRESULT result = target_->Resize(
+                        D2D1::SizeU(LOWORD(lparam), HIWORD(lparam)));
+                    if (device_state_.apply(render_result(result))) {
+                        discard_device_resources();
+                    }
                 }
                 return 0;
             case WM_DPICHANGED: {
@@ -258,6 +297,8 @@ private:
                     suggested->right - suggested->left,
                     suggested->bottom - suggested->top,
                     SWP_NOACTIVATE | SWP_NOZORDER);
+                dpi_ = static_cast<float>(HIWORD(wparam));
+                discard_device_resources();
                 return 0;
             }
             case WM_LBUTTONDBLCLK:
@@ -309,42 +350,65 @@ private:
         if (!target_) {
             RECT client{};
             GetClientRect(window_, &client);
+            dpi_ = static_cast<float>(GetDpiForWindow(window_));
             const D2D1_RENDER_TARGET_PROPERTIES properties =
                 D2D1::RenderTargetProperties(
                     D2D1_RENDER_TARGET_TYPE_DEFAULT,
                     D2D1::PixelFormat(DXGI_FORMAT_UNKNOWN,
                                       D2D1_ALPHA_MODE_UNKNOWN),
-                    96.0F, 96.0F);
-            if (FAILED(factory_->CreateHwndRenderTarget(
+                    dpi_, dpi_);
+            ComPtr<ID2D1HwndRenderTarget> target;
+            ComPtr<ID2D1SolidColorBrush> text_brush;
+            ComPtr<ID2D1SolidColorBrush> online_brush;
+            ComPtr<ID2D1SolidColorBrush> stale_brush;
+            ComPtr<ID2D1SolidColorBrush> offline_brush;
+            HRESULT result = factory_->CreateHwndRenderTarget(
                 properties,
                 D2D1::HwndRenderTargetProperties(
                     window_, D2D1::SizeU(
                         static_cast<UINT32>(std::max(0L, client.right)),
                         static_cast<UINT32>(std::max(0L, client.bottom)))),
-                target_.GetAddressOf()))) {
+                target.GetAddressOf());
+            if (SUCCEEDED(result)) {
+                result = target->CreateSolidColorBrush(
+                    D2D1::ColorF(0xE8E8EA), text_brush.GetAddressOf());
+            }
+            if (SUCCEEDED(result)) {
+                result = target->CreateSolidColorBrush(
+                    D2D1::ColorF(0x27AE60), online_brush.GetAddressOf());
+            }
+            if (SUCCEEDED(result)) {
+                result = target->CreateSolidColorBrush(
+                    D2D1::ColorF(0xF2C94C), stale_brush.GetAddressOf());
+            }
+            if (SUCCEEDED(result)) {
+                result = target->CreateSolidColorBrush(
+                    D2D1::ColorF(0xEB5757), offline_brush.GetAddressOf());
+            }
+            if (FAILED(result)) {
+                device_state_.creation_completed(false);
                 return false;
             }
-            if (FAILED(target_->CreateSolidColorBrush(
-                D2D1::ColorF(0xE8E8EA), &text_brush_)) ||
-                FAILED(target_->CreateSolidColorBrush(
-                    D2D1::ColorF(0x27AE60), &online_brush_)) ||
-                FAILED(target_->CreateSolidColorBrush(
-                    D2D1::ColorF(0xF2C94C), &stale_brush_)) ||
-                FAILED(target_->CreateSolidColorBrush(
-                    D2D1::ColorF(0xEB5757), &offline_brush_))) {
-                return false;
-            }
+            target_ = std::move(target);
+            text_brush_ = std::move(text_brush);
+            online_brush_ = std::move(online_brush);
+            stale_brush_ = std::move(stale_brush);
+            offline_brush_ = std::move(offline_brush);
+            device_state_.creation_completed(true);
         }
-        return true;
+        return device_state_.ready() && target_ && text_brush_ &&
+               online_brush_ && stale_brush_ && offline_brush_ && text_format_;
     }
 
     void discard_device_resources() {
         cache_.clear();
+        decode_cache_.clear();
         offline_brush_.Reset();
         stale_brush_.Reset();
         online_brush_.Reset();
         text_brush_.Reset();
         target_.Reset();
+        device_state_.creation_completed(false);
     }
 
     void paint() {
@@ -367,8 +431,12 @@ private:
         }
         RECT client{};
         GetClientRect(window_, &client);
-        layouts_ = LayoutEngine::compute(visible.size(),
+        const DpiMetrics metrics = DpiMetrics::from_dpi(
+            static_cast<unsigned int>(dpi_));
+        const Rect client_dips = metrics.pixels_to_dips(
             {client.left, client.top, client.right, client.bottom});
+        layouts_ = LayoutEngine::compute(visible.size(),
+                                         client_dips);
         target_->BeginDraw();
         target_->Clear(D2D1::ColorF(0x101317));
         std::set<protocol::AgentGuid> live;
@@ -377,11 +445,15 @@ private:
             draw_tile(visible[index], layouts_[index]);
         }
         for (auto iterator = cache_.begin(); iterator != cache_.end();) {
-            if (!live.contains(iterator->first)) iterator = cache_.erase(iterator);
-            else ++iterator;
+            if (!live.contains(iterator->first)) {
+                decode_cache_.erase(iterator->first);
+                iterator = cache_.erase(iterator);
+            } else {
+                ++iterator;
+            }
         }
         const HRESULT result = target_->EndDraw();
-        if (result == D2DERR_RECREATE_TARGET) {
+        if (device_state_.apply(render_result(result))) {
             discard_device_resources();
         }
         EndPaint(window_, &paint_structure);
@@ -425,8 +497,12 @@ private:
         std::array<wchar_t, 512> label{};
         const std::wstring name = widen(agent.employee_name);
         const std::wstring host = widen(agent.hostname);
+        const wchar_t* status_text = agent.status == AgentStatus::Online
+            ? L"Online" : agent.status == AgentStatus::Stale
+                ? L"Stale" : L"Offline";
         static_cast<void>(_snwprintf_s(label.data(), label.size(), _TRUNCATE,
-            L"%s  •  %s  •  %.1f FPS", name.c_str(), host.c_str(), agent.fps));
+            L"%s  •  %s  •  %.1f FPS  •  %s",
+            name.c_str(), host.c_str(), agent.fps, status_text));
         D2D1_RECT_F text_rect = to_d2d(layout.label);
         text_rect.left += 20.0F;
         target_->DrawText(label.data(), static_cast<UINT32>(wcslen(label.data())),
@@ -436,14 +512,18 @@ private:
 
     ID2D1Bitmap* bitmap_for(const AgentSnapshot& agent) {
         if (!agent.frame) return nullptr;
-        auto found = cache_.find(agent.guid);
-        if (found != cache_.end() &&
-            found->second.generation == agent.generation &&
-            found->second.sequence == agent.frame->sequence) {
-            return found->second.bitmap.Get();
+        const FrameIdentity identity{
+            agent.guid, agent.generation, agent.frame->sequence};
+        if (!decode_cache_.should_decode(identity)) {
+            const auto found = cache_.find(agent.guid);
+            return found == cache_.end() ? nullptr : found->second.bitmap.Get();
         }
+        cache_.erase(agent.guid);
         const auto decoded = decoder_.decode(agent.frame->encoded_image);
-        if (!decoded) return nullptr;
+        if (!decoded) {
+            decode_cache_.record_attempt(identity, false);
+            return nullptr;
+        }
         ComPtr<ID2D1Bitmap> bitmap;
         const D2D1_BITMAP_PROPERTIES properties = D2D1::BitmapProperties(
             D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,
@@ -454,15 +534,18 @@ private:
             properties, &bitmap))) {
             return nullptr;
         }
-        CachedBitmap cached{agent.generation, agent.frame->sequence,
-                            std::move(bitmap)};
+        decode_cache_.record_attempt(identity, true);
+        CachedBitmap cached{std::move(bitmap)};
         ID2D1Bitmap* result = cached.bitmap.Get();
         cache_[agent.guid] = std::move(cached);
         return result;
     }
 
     std::optional<AgentSnapshot> hit_agent(const int x, const int y) const {
-        const auto hit = LayoutEngine::hit_test(layouts_, x, y);
+        const DpiMetrics metrics = DpiMetrics::from_dpi(
+            static_cast<unsigned int>(dpi_));
+        const auto [dip_x, dip_y] = metrics.pixel_point_to_dips(x, y);
+        const auto hit = LayoutEngine::hit_test(layouts_, dip_x, dip_y);
         if (!hit) return std::nullopt;
         if (const auto selected = router_.selection()) {
             const auto found = std::find_if(displayed_.begin(), displayed_.end(),
@@ -542,9 +625,11 @@ private:
     HINSTANCE instance_;
     HWND window_ = nullptr;
     AgentRegistry& registry_;
-    FocusRouter router_;
+    FocusRouter& router_;
     NameStore& names_;
     JpegDecoder decoder_;
+    FrameDecodeCache decode_cache_;
+    DeviceResourceState device_state_;
     ComPtr<ID2D1Factory> factory_;
     ComPtr<IDWriteFactory> write_factory_;
     ComPtr<IDWriteTextFormat> text_format_;
@@ -556,14 +641,15 @@ private:
     std::map<protocol::AgentGuid, CachedBitmap> cache_;
     std::vector<AgentSnapshot> displayed_;
     std::vector<TileLayout> layouts_;
+    float dpi_ = 96.0F;
     bool fullscreen_ = false;
     DWORD previous_style_ = 0;
     RECT previous_rect_{};
 };
 
 ObserverWindow::ObserverWindow(HINSTANCE instance, AgentRegistry& registry,
-                               ProfileSink& profile_sink, NameStore& names)
-    : impl_(std::make_unique<Impl>(instance, registry, profile_sink, names)) {}
+                               FocusRouter& router, NameStore& names)
+    : impl_(std::make_unique<Impl>(instance, registry, router, names)) {}
 
 ObserverWindow::~ObserverWindow() = default;
 

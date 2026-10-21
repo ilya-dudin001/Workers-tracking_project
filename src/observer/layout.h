@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <optional>
+#include <utility>
 #include <vector>
 
 namespace monitor::observer {
@@ -12,6 +13,7 @@ struct Rect {
     int right = 0;
     int bottom = 0;
     [[nodiscard]] bool intersects(const Rect& other) const noexcept;
+    bool operator==(const Rect&) const = default;
 };
 
 struct TileLayout {
@@ -28,6 +30,19 @@ public:
                                                          Rect client);
     [[nodiscard]] static std::optional<std::size_t> hit_test(
         const std::vector<TileLayout>& tiles, int x, int y);
+};
+
+class DpiMetrics {
+public:
+    [[nodiscard]] static DpiMetrics from_dpi(unsigned int dpi) noexcept;
+    [[nodiscard]] Rect pixels_to_dips(Rect pixels) const noexcept;
+    [[nodiscard]] std::pair<int, int> pixel_point_to_dips(
+        int x, int y) const noexcept;
+    [[nodiscard]] float dpi() const noexcept;
+
+private:
+    explicit DpiMetrics(float dpi) noexcept : dpi_(dpi) {}
+    float dpi_ = 96.0F;
 };
 
 }

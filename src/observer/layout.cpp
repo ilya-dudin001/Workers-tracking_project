@@ -73,4 +73,27 @@ std::optional<std::size_t> LayoutEngine::hit_test(
     return std::nullopt;
 }
 
+DpiMetrics DpiMetrics::from_dpi(const unsigned int dpi) noexcept {
+    return DpiMetrics(static_cast<float>(dpi == 0U ? 96U : dpi));
+}
+
+Rect DpiMetrics::pixels_to_dips(const Rect pixels) const noexcept {
+    const auto convert = [this](const int value) {
+        return static_cast<int>(std::lround(
+            static_cast<double>(value) * 96.0 / static_cast<double>(dpi_)));
+    };
+    return {convert(pixels.left), convert(pixels.top),
+            convert(pixels.right), convert(pixels.bottom)};
+}
+
+std::pair<int, int> DpiMetrics::pixel_point_to_dips(
+    const int x, const int y) const noexcept {
+    const Rect converted = pixels_to_dips({x, y, x, y});
+    return {converted.left, converted.top};
+}
+
+float DpiMetrics::dpi() const noexcept {
+    return dpi_;
+}
+
 }

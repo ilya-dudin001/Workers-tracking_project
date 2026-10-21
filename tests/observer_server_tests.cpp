@@ -1,11 +1,19 @@
 #include "common/winsock_socket.h"
+#include "common/stream_decoder.h"
+#include "observer/focus_router.h"
 #include "observer/iocp_server.h"
 
 #include <gtest/gtest.h>
 
 #include <array>
+#include <atomic>
+#include <barrier>
 #include <chrono>
+#include <future>
+#include <memory>
+#include <optional>
 #include <thread>
+#include <variant>
 #include <vector>
 
 namespace {
@@ -36,11 +44,41 @@ bool wait_for(const auto& predicate, const std::chrono::milliseconds timeout = 2
     return predicate();
 }
 
-Socket connect_to(const IocpServer& server) {
-    Socket socket = Socket::connect_ipv4("127.0.0.1", server.port(), 1s);
+Socket connect_to(const IocpServer& server,
+                  const std::chrono::milliseconds timeout = 1s) {
+    Socket socket = Socket::connect_ipv4("127.0.0.1", server.port(), timeout);
     socket.set_receive_timeout(200ms);
     socket.set_send_timeout(1s);
     return socket;
+}
+
+std::optional<monitor::protocol::SetProfile> receive_profile(
+    Socket& socket, const std::chrono::milliseconds timeout = 2s) {
+    monitor::protocol::StreamDecoder decoder;
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        const auto received = socket.receive_chunk(256);
+        if (received.status == ReceiveStatus::Closed) return std::nullopt;
+        if (received.status != ReceiveStatus::Data) continue;
+        for (const auto& message : decoder.feed(received.bytes)) {
+            if (const auto* profile =
+                    std::get_if<monitor::protocol::SetProfile>(&message)) {
+                return *profile;
+            }
+        }
+    }
+    return std::nullopt;
+}
+
+bool drain_until_closed(Socket& socket,
+                        const std::chrono::milliseconds timeout = 2s) {
+    return wait_for([&] {
+        try {
+            return socket.receive_chunk(256).status == ReceiveStatus::Closed;
+        } catch (const std::runtime_error&) {
+            return true;
+        }
+    }, timeout);
 }
 
 TEST(ObserverServerIntegration, RequiresHelloAndRejectsWrongDirectionPackets) {
@@ -139,6 +177,133 @@ TEST(ObserverServerIntegration, HelloTimeoutIsFinite) {
         return silent.receive_chunk(64).status == ReceiveStatus::Closed;
     }, 1s));
     server.stop();
+}
+
+TEST(ObserverServerIntegration, RejectsHelloProcessedAfterDeadline) {
+    monitor::net::WinsockRuntime runtime;
+    AgentRegistry registry;
+    IocpServer server(registry, {.bind_address = "127.0.0.1", .port = 0,
+                                 .hello_timeout = 50ms});
+    ASSERT_TRUE(server.start());
+    Socket late = connect_to(server);
+    std::this_thread::sleep_for(80ms);
+    try {
+        late.send_all(monitor::protocol::encode(
+            Message{Hello{server_guid(8), "late", "host"}}));
+    } catch (const std::runtime_error&) {
+    }
+    EXPECT_TRUE(drain_until_closed(late, 1s));
+    EXPECT_TRUE(registry.snapshot(AgentRegistry::Clock::now()).empty());
+    server.stop();
+}
+
+TEST(ObserverServerIntegration, ConcurrentDuplicateHelloHasSingleNewestOwner) {
+    monitor::net::WinsockRuntime runtime;
+    AgentRegistry registry;
+    IocpServer server(registry, {.bind_address = "127.0.0.1", .port = 0});
+    ASSERT_TRUE(server.start());
+    Socket first = connect_to(server);
+    Socket second = connect_to(server);
+    std::barrier start(3);
+    auto send_hello = [&](Socket& socket, const char* name) {
+        start.arrive_and_wait();
+        socket.send_all(monitor::protocol::encode(
+            Message{Hello{server_guid(9), name, "host"}}));
+    };
+    auto one = std::async(std::launch::async, send_hello,
+                          std::ref(first), "one");
+    auto two = std::async(std::launch::async, send_hello,
+                          std::ref(second), "two");
+    start.arrive_and_wait();
+    one.get();
+    two.get();
+    ASSERT_TRUE(wait_for([&] {
+        const auto items = registry.snapshot(AgentRegistry::Clock::now());
+        return items.size() == 1 && items[0].generation >= 2U &&
+               items[0].status == monitor::observer::AgentStatus::Online;
+    }));
+    const auto owner_name =
+        registry.snapshot(AgentRegistry::Clock::now())[0].employee_name;
+    Socket* owner = owner_name == "one" ? &first : &second;
+    Socket* replaced = owner_name == "one" ? &second : &first;
+    ASSERT_TRUE(drain_until_closed(*replaced));
+    owner->send_all(monitor::protocol::encode(
+        Message{Frame{77, 16, 9, {1, 2, 3}}}));
+    ASSERT_TRUE(wait_for([&] {
+        const auto items = registry.snapshot(AgentRegistry::Clock::now());
+        return items[0].frame && items[0].frame->sequence == 77 &&
+               items[0].status == monitor::observer::AgentStatus::Online;
+    }));
+    server.stop();
+}
+
+TEST(ObserverServerIntegration, FocusedReconnectGetsFocusAndOldCannotUpdate) {
+    monitor::net::WinsockRuntime runtime;
+    AgentRegistry registry;
+    IocpServer server(registry, {.bind_address = "127.0.0.1", .port = 0});
+    auto router = std::make_shared<monitor::observer::FocusRouter>(server);
+    router->select(server_guid(10));
+    const std::weak_ptr<monitor::observer::FocusRouter> weak_router = router;
+    server.set_registration_handler(
+        [weak_router](const AgentGuid& id) {
+            if (const auto current = weak_router.lock()) {
+                current->agent_registered(id);
+            }
+        });
+    ASSERT_TRUE(server.start());
+    Socket old = connect_to(server);
+    old.send_all(monitor::protocol::encode(
+        Message{Hello{server_guid(10), "old", "host"}}));
+    ASSERT_EQ(receive_profile(old), monitor::observer::FocusRouter::focus_profile());
+
+    Socket replacement = connect_to(server);
+    replacement.send_all(monitor::protocol::encode(
+        Message{Hello{server_guid(10), "new", "host"}}));
+    ASSERT_EQ(receive_profile(replacement),
+              monitor::observer::FocusRouter::focus_profile());
+    try {
+        old.send_all(monitor::protocol::encode(
+            Message{Frame{87, 16, 9, {1, 2, 3}}}));
+    } catch (const std::runtime_error&) {
+    }
+    ASSERT_TRUE(drain_until_closed(old));
+    EXPECT_FALSE(registry.snapshot(AgentRegistry::Clock::now())[0].frame);
+    replacement.send_all(monitor::protocol::encode(
+        Message{Frame{88, 16, 9, {1, 2, 3}}}));
+    ASSERT_TRUE(wait_for([&] {
+        const auto items = registry.snapshot(AgentRegistry::Clock::now());
+        return items.size() == 1 && items[0].employee_name == "new" &&
+               items[0].frame && items[0].frame->sequence == 88;
+    }));
+    server.stop();
+}
+
+TEST(ObserverServerIntegration, StopRacingAcceptLeavesNoConnectionsOnline) {
+    monitor::net::WinsockRuntime runtime;
+    for (int repetition = 0; repetition < 100; ++repetition) {
+        AgentRegistry registry;
+        IocpServer server(registry, {.bind_address = "127.0.0.1", .port = 0});
+        ASSERT_TRUE(server.start());
+        std::atomic<bool> connected{false};
+        std::jthread connector([&] {
+            try {
+                Socket socket = connect_to(server, 20ms);
+                connected = true;
+                socket.send_all(monitor::protocol::encode(
+                    Message{Hello{server_guid(11), "worker", "host"}}));
+            } catch (const std::exception&) {
+            }
+        });
+        const auto started = std::chrono::steady_clock::now();
+        server.stop();
+        connector.join();
+        EXPECT_LT(std::chrono::steady_clock::now() - started, 2s);
+        EXPECT_EQ(server.connection_count(), 0U);
+        for (const auto& item : registry.snapshot(AgentRegistry::Clock::now())) {
+            EXPECT_NE(item.status, monitor::observer::AgentStatus::Online);
+        }
+        static_cast<void>(connected);
+    }
 }
 
 }
