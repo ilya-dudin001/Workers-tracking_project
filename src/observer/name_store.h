@@ -15,6 +15,7 @@ public:
     [[nodiscard]] bool save(const protocol::AgentGuid& guid,
                             const std::string& utf8_name) const;
     [[nodiscard]] std::map<protocol::AgentGuid, std::string> load() const;
+    [[nodiscard]] const std::filesystem::path& directory() const noexcept;
 
 private:
     std::filesystem::path directory_;

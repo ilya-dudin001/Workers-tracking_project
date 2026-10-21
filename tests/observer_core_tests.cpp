@@ -4,6 +4,7 @@
 #include "observer/jpeg_decoder.h"
 #include "observer/layout.h"
 #include "observer/name_store.h"
+#include "observer/overlapped_lifetime.h"
 #include "observer/render_state.h"
 
 #include <gtest/gtest.h>
@@ -12,6 +13,7 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <atomic>
 #include <string>
 #include <system_error>
 #include <vector>
@@ -166,6 +168,13 @@ TEST(NameStore, RoundTripsAtomicallyAndIgnoresCorruptOrOversizedRecords) {
     std::filesystem::remove_all(root);
 }
 
+TEST(NameStore, DefaultPathUsesWindowsLocalAppDataContract) {
+    const auto store = monitor::observer::NameStore::local_app_data();
+    EXPECT_TRUE(store.directory().is_absolute());
+    EXPECT_EQ(store.directory().filename(), "observer_names");
+    EXPECT_EQ(store.directory().parent_path().filename(), "WorkersTracking");
+}
+
 TEST(FrameDecodeCache, CachesSuccessAndFailureUntilFrameIdentityChanges) {
     monitor::observer::FrameDecodeCache cache;
     const monitor::observer::FrameIdentity first{guid(1), 7, 10};
@@ -194,6 +203,44 @@ TEST(DeviceResourceState, DiscardsOnResizeOrEndDrawDeviceLoss) {
     state.creation_completed(true);
     EXPECT_TRUE(state.apply(monitor::observer::RenderResult::Failed));
     EXPECT_FALSE(state.ready());
+    EXPECT_EQ(monitor::observer::classify_bitmap_creation(
+                  monitor::observer::RenderResult::RecreateTarget),
+              monitor::observer::BitmapCreateAction::DiscardResources);
+    EXPECT_EQ(monitor::observer::classify_bitmap_creation(
+                  monitor::observer::RenderResult::Failed),
+              monitor::observer::BitmapCreateAction::CacheFrameFailure);
+}
+
+TEST(OverlappedLifetime, SynchronousCompletionHasExactlyOneOwner) {
+    struct Probe {
+        explicit Probe(std::atomic<int>& destructions)
+            : destructions(destructions) {}
+        ~Probe() { ++destructions; }
+        std::atomic<int>& destructions;
+    };
+    std::atomic<int> destructions{0};
+    std::atomic<int> in_flight{0};
+    const bool launched = monitor::observer::launch_overlapped(
+        std::make_unique<Probe>(destructions),
+        [&] { ++in_flight; },
+        [&](Probe* raw) {
+            std::unique_ptr<Probe> completion_owner(raw);
+            --in_flight;
+            return true;
+        },
+        [&] { --in_flight; });
+    EXPECT_TRUE(launched);
+    EXPECT_EQ(destructions, 1);
+    EXPECT_EQ(in_flight, 0);
+
+    const bool failed = monitor::observer::launch_overlapped(
+        std::make_unique<Probe>(destructions),
+        [&] { ++in_flight; },
+        [](Probe*) { return false; },
+        [&] { --in_flight; });
+    EXPECT_FALSE(failed);
+    EXPECT_EQ(destructions, 2);
+    EXPECT_EQ(in_flight, 0);
 }
 
 TEST(JpegDecoder, DecodesValidImageAndDropsMalformedOrOversizedMetadata) {

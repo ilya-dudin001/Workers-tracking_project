@@ -443,6 +443,11 @@ private:
         for (std::size_t index = 0; index < visible.size(); ++index) {
             live.insert(visible[index].guid);
             draw_tile(visible[index], layouts_[index]);
+            if (!target_) break;
+        }
+        if (!target_) {
+            EndPaint(window_, &paint_structure);
+            return;
         }
         for (auto iterator = cache_.begin(); iterator != cache_.end();) {
             if (!live.contains(iterator->first)) {
@@ -467,6 +472,7 @@ private:
             layout.content.top + inset, layout.content.right - inset,
             layout.content.bottom - inset};
         ID2D1Bitmap* bitmap = bitmap_for(agent);
+        if (!target_) return;
         if (bitmap != nullptr) {
             const D2D1_SIZE_F source = bitmap->GetSize();
             const float available_width =
@@ -528,10 +534,19 @@ private:
         const D2D1_BITMAP_PROPERTIES properties = D2D1::BitmapProperties(
             D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,
                               D2D1_ALPHA_MODE_PREMULTIPLIED));
-        if (FAILED(target_->CreateBitmap(
+        const HRESULT create_result = target_->CreateBitmap(
             D2D1::SizeU(decoded->width, decoded->height),
             decoded->pixels.data(), decoded->width * 4U,
-            properties, &bitmap))) {
+            properties, &bitmap);
+        const BitmapCreateAction action =
+            classify_bitmap_creation(render_result(create_result));
+        if (action == BitmapCreateAction::DiscardResources) {
+            static_cast<void>(device_state_.apply(RenderResult::RecreateTarget));
+            discard_device_resources();
+            return nullptr;
+        }
+        if (action == BitmapCreateAction::CacheFrameFailure) {
+            decode_cache_.record_attempt(identity, false);
             return nullptr;
         }
         decode_cache_.record_attempt(identity, true);

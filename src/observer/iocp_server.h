@@ -17,7 +17,9 @@ public:
         std::string bind_address = "0.0.0.0";
         std::uint16_t port = 45873;
         std::chrono::milliseconds hello_timeout{3000};
+        std::chrono::milliseconds monitor_poll_interval{25};
         std::size_t worker_threads = 0;
+        std::function<void()> connection_accepted_handler;
     };
 
     explicit IocpServer(AgentRegistry& registry, Config config = {});
@@ -30,6 +32,8 @@ public:
     [[nodiscard]] std::uint16_t port() const noexcept;
     [[nodiscard]] std::string last_error() const;
     [[nodiscard]] std::size_t connection_count() const;
+    [[nodiscard]] std::size_t in_flight_operation_count() const;
+    [[nodiscard]] std::uint64_t timeout_monitor_passes() const noexcept;
     void set_registration_handler(
         std::function<void(const protocol::AgentGuid&)> handler);
     bool send_profile(const protocol::AgentGuid& guid,

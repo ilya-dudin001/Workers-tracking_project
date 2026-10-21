@@ -7,6 +7,7 @@
 #include <windows.h>
 
 #include "common/stream_decoder.h"
+#include "observer/overlapped_lifetime.h"
 
 #include <algorithm>
 #include <array>
@@ -52,6 +53,12 @@ public:
 
         Operation(OperationKind value, std::shared_ptr<Connection> owner)
             : kind(value), connection(std::move(owner)) {}
+
+        ~Operation() {
+            if (accepted_socket != INVALID_SOCKET) {
+                closesocket(accepted_socket);
+            }
+        }
     };
 
     struct Connection : std::enable_shared_from_this<Connection> {
@@ -86,6 +93,10 @@ public:
             if (lifecycle_ == Lifecycle::Running) return true;
             if (lifecycle_ != Lifecycle::Stopped) return false;
             lifecycle_ = Lifecycle::Starting;
+        }
+        if (config_.hello_timeout <= std::chrono::milliseconds::zero() ||
+            config_.monitor_poll_interval <= std::chrono::milliseconds::zero()) {
+            return fail("server timeouts must be positive");
         }
         iocp_ = CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, 0);
         if (iocp_ == nullptr) {
@@ -181,6 +192,7 @@ public:
                 connections.push_back(connection);
             }
         }
+        lifecycle_cv_.notify_all();
         if (listener != INVALID_SOCKET) {
             closesocket(listener);
         }
@@ -271,6 +283,15 @@ public:
         return connections_.size();
     }
 
+    std::size_t in_flight_operation_count() const {
+        std::scoped_lock lock(operation_mutex_);
+        return active_operations_;
+    }
+
+    std::uint64_t timeout_monitor_passes() const noexcept {
+        return timeout_monitor_passes_.load();
+    }
+
     void set_registration_handler(
         std::function<void(const protocol::AgentGuid&)> handler) {
         std::scoped_lock lock(state_mutex_);
@@ -306,9 +327,15 @@ private:
                     return lifecycle_ != Lifecycle::Starting;
                 });
                 if (lifecycle_ != Lifecycle::Running) return;
+                if (lifecycle_cv_.wait_for(
+                        lock, config_.monitor_poll_interval, [this] {
+                            return lifecycle_ != Lifecycle::Running;
+                        })) {
+                    return;
+                }
             }
+            ++timeout_monitor_passes_;
             expire_hello_deadlines();
-            std::this_thread::sleep_for(std::chrono::milliseconds(25));
         }
     }
 
@@ -318,29 +345,29 @@ private:
         operation->accepted_socket = WSASocketW(
             AF_INET, SOCK_STREAM, IPPROTO_TCP, nullptr, 0, WSA_FLAG_OVERLAPPED);
         if (operation->accepted_socket == INVALID_SOCKET) return;
-        DWORD received = 0;
-        BOOL result = FALSE;
         {
             std::scoped_lock lock(state_mutex_);
             if ((lifecycle_ != Lifecycle::Running &&
                  lifecycle_ != Lifecycle::Starting) ||
                 listener_ == INVALID_SOCKET) {
-                closesocket(operation->accepted_socket);
                 return;
             }
-            add_operation();
-            result = accept_ex_(
-                listener_, operation->accepted_socket,
-                operation->accept_buffer.data(), 0,
-                sizeof(sockaddr_in) + 16U, sizeof(sockaddr_in) + 16U,
-                &received, &operation->overlapped);
+            static_cast<void>(launch_overlapped(
+                std::move(operation),
+                [this] { add_operation(); },
+                [this](Operation* raw) {
+                    DWORD received = 0;
+                    const BOOL result = accept_ex_(
+                        listener_, raw->accepted_socket,
+                        raw->accept_buffer.data(), 0,
+                        sizeof(sockaddr_in) + 16U,
+                        sizeof(sockaddr_in) + 16U,
+                        &received, &raw->overlapped);
+                    return result != FALSE ||
+                           WSAGetLastError() == ERROR_IO_PENDING;
+                },
+                [this] { finish_operation(); }));
         }
-        if (!result && WSAGetLastError() != ERROR_IO_PENDING) {
-            finish_operation();
-            closesocket(operation->accepted_socket);
-            return;
-        }
-        static_cast<void>(operation.release());
     }
 
     void accept_connection(const SOCKET socket) {
@@ -366,6 +393,14 @@ private:
             static_cast<void>(iterator);
             if (!inserted) {
                 closesocket(socket);
+                return;
+            }
+        }
+        if (config_.connection_accepted_handler) {
+            try {
+                config_.connection_accepted_handler();
+            } catch (...) {
+                close_connection(connection);
                 return;
             }
         }
@@ -404,27 +439,32 @@ private:
     void post_receive(const std::shared_ptr<Connection>& connection) {
         auto operation = std::make_unique<Operation>(
             OperationKind::Receive, connection);
-        WSABUF buffer{
-            static_cast<ULONG>(operation->receive_buffer.size()),
-            reinterpret_cast<char*>(operation->receive_buffer.data())};
-        DWORD flags = 0;
-        DWORD received = 0;
-        int result = SOCKET_ERROR;
+        bool launched = false;
         {
             std::scoped_lock lock(state_mutex_);
             if (lifecycle_ != Lifecycle::Running || connection->closed) {
                 return;
             }
-            add_operation();
-            result = WSARecv(connection->socket, &buffer, 1, &received,
-                             &flags, &operation->overlapped, nullptr);
+            launched = launch_overlapped(
+                std::move(operation),
+                [this] { add_operation(); },
+                [connection](Operation* raw) {
+                    WSABUF buffer{
+                        static_cast<ULONG>(raw->receive_buffer.size()),
+                        reinterpret_cast<char*>(raw->receive_buffer.data())};
+                    DWORD flags = 0;
+                    DWORD received = 0;
+                    const int result = WSARecv(
+                        connection->socket, &buffer, 1, &received, &flags,
+                        &raw->overlapped, nullptr);
+                    return result != SOCKET_ERROR ||
+                           WSAGetLastError() == WSA_IO_PENDING;
+                },
+                [this] { finish_operation(); });
         }
-        if (result == SOCKET_ERROR && WSAGetLastError() != WSA_IO_PENDING) {
-            finish_operation();
+        if (!launched) {
             close_connection(connection);
-            return;
         }
-        static_cast<void>(operation.release());
     }
 
     void post_next_send(const std::shared_ptr<Connection>& connection) {
@@ -443,29 +483,35 @@ private:
     }
 
     void issue_send(std::unique_ptr<Operation> operation) {
-        WSABUF buffer{
-            static_cast<ULONG>(operation->send_buffer.size() -
-                               operation->send_offset),
-            reinterpret_cast<char*>(operation->send_buffer.data() +
-                                    operation->send_offset)};
-        DWORD sent = 0;
-        int result = SOCKET_ERROR;
+        const auto connection = operation->connection;
+        bool launched = false;
         {
             std::scoped_lock lock(state_mutex_);
             if (lifecycle_ != Lifecycle::Running ||
-                operation->connection->closed) {
+                connection->closed) {
                 return;
             }
-            add_operation();
-            result = WSASend(operation->connection->socket, &buffer, 1,
-                             &sent, 0, &operation->overlapped, nullptr);
+            launched = launch_overlapped(
+                std::move(operation),
+                [this] { add_operation(); },
+                [connection](Operation* raw) {
+                    WSABUF buffer{
+                        static_cast<ULONG>(raw->send_buffer.size() -
+                                           raw->send_offset),
+                        reinterpret_cast<char*>(
+                            raw->send_buffer.data() + raw->send_offset)};
+                    DWORD sent = 0;
+                    const int result = WSASend(
+                        connection->socket, &buffer, 1, &sent, 0,
+                        &raw->overlapped, nullptr);
+                    return result != SOCKET_ERROR ||
+                           WSAGetLastError() == WSA_IO_PENDING;
+                },
+                [this] { finish_operation(); });
         }
-        if (result == SOCKET_ERROR && WSAGetLastError() != WSA_IO_PENDING) {
-            finish_operation();
-            close_connection(operation->connection);
-            return;
+        if (!launched) {
+            close_connection(connection);
         }
-        static_cast<void>(operation.release());
     }
 
     void worker_loop() {
@@ -650,9 +696,10 @@ private:
     std::unordered_map<SOCKET, std::shared_ptr<Connection>> connections_;
     std::map<protocol::AgentGuid, std::shared_ptr<Connection>> by_guid_;
     std::function<void(const protocol::AgentGuid&)> registration_handler_;
-    std::mutex operation_mutex_;
+    mutable std::mutex operation_mutex_;
     std::condition_variable operation_cv_;
     std::size_t active_operations_ = 0;
+    std::atomic<std::uint64_t> timeout_monitor_passes_{0};
 };
 
 IocpServer::IocpServer(AgentRegistry& registry, Config config)
@@ -678,6 +725,14 @@ std::string IocpServer::last_error() const {
 
 std::size_t IocpServer::connection_count() const {
     return impl_->connection_count();
+}
+
+std::size_t IocpServer::in_flight_operation_count() const {
+    return impl_->in_flight_operation_count();
+}
+
+std::uint64_t IocpServer::timeout_monitor_passes() const noexcept {
+    return impl_->timeout_monitor_passes();
 }
 
 void IocpServer::set_registration_handler(

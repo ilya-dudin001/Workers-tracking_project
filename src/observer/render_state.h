@@ -3,6 +3,10 @@
 namespace monitor::observer {
 
 enum class RenderResult { Ok, RecreateTarget, Failed };
+enum class BitmapCreateAction { UseBitmap, DiscardResources, CacheFrameFailure };
+
+[[nodiscard]] BitmapCreateAction classify_bitmap_creation(
+    RenderResult result) noexcept;
 
 class DeviceResourceState {
 public:

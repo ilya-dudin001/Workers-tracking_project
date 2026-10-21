@@ -183,7 +183,8 @@ TEST(ObserverServerIntegration, RejectsHelloProcessedAfterDeadline) {
     monitor::net::WinsockRuntime runtime;
     AgentRegistry registry;
     IocpServer server(registry, {.bind_address = "127.0.0.1", .port = 0,
-                                 .hello_timeout = 50ms});
+                                 .hello_timeout = 50ms,
+                                 .monitor_poll_interval = 5s});
     ASSERT_TRUE(server.start());
     Socket late = connect_to(server);
     std::this_thread::sleep_for(80ms);
@@ -194,6 +195,7 @@ TEST(ObserverServerIntegration, RejectsHelloProcessedAfterDeadline) {
     }
     EXPECT_TRUE(drain_until_closed(late, 1s));
     EXPECT_TRUE(registry.snapshot(AgentRegistry::Clock::now()).empty());
+    EXPECT_EQ(server.timeout_monitor_passes(), 0U);
     server.stop();
 }
 
@@ -282,27 +284,50 @@ TEST(ObserverServerIntegration, StopRacingAcceptLeavesNoConnectionsOnline) {
     monitor::net::WinsockRuntime runtime;
     for (int repetition = 0; repetition < 100; ++repetition) {
         AgentRegistry registry;
-        IocpServer server(registry, {.bind_address = "127.0.0.1", .port = 0});
+        std::atomic<int> accepted{0};
+        std::promise<void> second_accepted_promise;
+        auto second_accepted = second_accepted_promise.get_future();
+        std::promise<void> release_promise;
+        auto release = release_promise.get_future().share();
+        IocpServer server(registry, {
+            .bind_address = "127.0.0.1",
+            .port = 0,
+            .connection_accepted_handler = [&] {
+                if (++accepted == 2) {
+                    second_accepted_promise.set_value();
+                    release.wait();
+                }
+            }});
         ASSERT_TRUE(server.start());
-        std::atomic<bool> connected{false};
-        std::jthread connector([&] {
-            try {
-                Socket socket = connect_to(server, 20ms);
-                connected = true;
-                socket.send_all(monitor::protocol::encode(
-                    Message{Hello{server_guid(11), "worker", "host"}}));
-            } catch (const std::exception&) {
-            }
+        Socket established = connect_to(server);
+        ASSERT_TRUE(wait_for([&] { return accepted.load() >= 1; }));
+
+        std::jthread racing_connector([&] {
+            Socket racing = connect_to(server);
+            static_cast<void>(racing);
         });
+        if (second_accepted.wait_for(1s) != std::future_status::ready) {
+            release_promise.set_value();
+            racing_connector.join();
+            server.stop();
+            ADD_FAILURE() << "second accept did not reach completion seam";
+            continue;
+        }
+        EXPECT_GE(server.connection_count(), 2U);
+        EXPECT_GT(server.in_flight_operation_count(), 0U);
         const auto started = std::chrono::steady_clock::now();
-        server.stop();
-        connector.join();
+        auto stopping = std::async(std::launch::async, [&] { server.stop(); });
+        EXPECT_EQ(stopping.wait_for(20ms), std::future_status::timeout);
+        release_promise.set_value();
+        ASSERT_EQ(stopping.wait_for(2s), std::future_status::ready);
+        stopping.get();
+        racing_connector.join();
         EXPECT_LT(std::chrono::steady_clock::now() - started, 2s);
         EXPECT_EQ(server.connection_count(), 0U);
+        EXPECT_EQ(server.in_flight_operation_count(), 0U);
         for (const auto& item : registry.snapshot(AgentRegistry::Clock::now())) {
             EXPECT_NE(item.status, monitor::observer::AgentStatus::Online);
         }
-        static_cast<void>(connected);
     }
 }
 

@@ -96,6 +96,7 @@ target_sources(observer_core
             src/observer/jpeg_decoder.h
             src/observer/layout.h
             src/observer/name_store.h
+            src/observer/overlapped_lifetime.h
             src/observer/render_state.h
     PRIVATE
         src/observer/agent_registry.cpp
@@ -108,7 +109,7 @@ target_sources(observer_core
         src/observer/render_state.cpp
 )
 target_include_directories(observer_core PUBLIC src)
-target_link_libraries(observer_core PUBLIC worker_common PRIVATE windowscodecs ole32)
+target_link_libraries(observer_core PUBLIC worker_common PRIVATE windowscodecs ole32 shell32)
 enable_strict_warnings(observer_core)
 
 add_executable(Observer WIN32

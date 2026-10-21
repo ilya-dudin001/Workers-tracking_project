@@ -1,12 +1,14 @@
 #include "observer/name_store.h"
 
 #include <windows.h>
+#include <shlobj.h>
 
 #include <array>
 #include <atomic>
 #include <cstdlib>
 #include <fstream>
 #include <limits>
+#include <stdexcept>
 #include <system_error>
 
 namespace monitor::observer {
@@ -60,15 +62,20 @@ NameStore::NameStore(std::filesystem::path directory)
     : directory_(std::move(directory)) {}
 
 NameStore NameStore::local_app_data() {
-    wchar_t* path = nullptr;
-    std::size_t length = 0;
-    if (_wdupenv_s(&path, &length, L"LOCALAPPDATA") != 0 || path == nullptr) {
-        return NameStore(std::filesystem::temp_directory_path() /
-                         "WorkersTracking" / "observer_names");
+    PWSTR path = nullptr;
+    const HRESULT result = SHGetKnownFolderPath(
+        FOLDERID_LocalAppData, KF_FLAG_CREATE, nullptr, &path);
+    if (FAILED(result) || path == nullptr) {
+        if (path != nullptr) CoTaskMemFree(path);
+        throw std::runtime_error("Windows LocalAppData is unavailable");
     }
     const std::filesystem::path root(path);
-    std::free(path);
+    CoTaskMemFree(path);
     return NameStore(root / "WorkersTracking" / "observer_names");
+}
+
+const std::filesystem::path& NameStore::directory() const noexcept {
+    return directory_;
 }
 
 bool NameStore::save(const protocol::AgentGuid& guid,
